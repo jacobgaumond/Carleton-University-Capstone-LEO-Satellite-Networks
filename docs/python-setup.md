@@ -12,9 +12,13 @@ The instructions in this file are dependent on the shells listed below. If you a
 
 Again, for more information on the topic refer to the official python documentation.
 
+### Python Version
+
+Note that this project uses the PyTorch package. Because of this, **the version of your python virtual environment** -- and therefore the version of the system python used to create the venv -- **must be at least 3.10**.
+
 ## Setup
 
-Note: Your system may use another command than `python` (e.g., `python3`). If this is the case, for this section specifically you may need to modify the commands to refer to the correct python command.
+Note: Your system may use another command than `python` (e.g., `python3`, `python3.14`, etc.). If this is the case, for this section specifically you may need to modify the commands to refer to the correct python command.
 
 To create a python virtual environment, execute one of the following commands in your shell from the repository's root directory:
 
