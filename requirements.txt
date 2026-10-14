@@ -2,3 +2,4 @@ pyopensky
 pandas
 numpy
 PyYAML
+torch==2.14.1
