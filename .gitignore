@@ -1,1 +1,6 @@
 .venv/
+credentials.json
+settings.conf
+*/data/
+adsb/config.yaml
+*.pyc
