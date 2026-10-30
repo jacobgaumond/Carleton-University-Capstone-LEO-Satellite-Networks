@@ -1,0 +1,11 @@
+# Copy this file to config.yaml and update the values before downloading.
+start_time: "2026-08-01T12:00:00+00:00"
+end_time: "2026-08-01T12:30:00+00:00"
+
+# Eastern Canada / northeastern US
+min_lat: 40.0
+max_lat: 50.0
+min_lon: -85.0
+max_lon: -60.0
+
+output_file: "data/history/adsb_trajectory_data.csv"

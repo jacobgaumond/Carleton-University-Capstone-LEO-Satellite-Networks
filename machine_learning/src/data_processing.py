@@ -151,10 +151,40 @@ def _clean_trajectories(data: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int
     position_change_mps = (
         2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(np.clip(haversine, 0, 1)))
     ) / elapsed_seconds
+    bearing_y = np.sin(delta_longitude) * np.cos(latitude)
+    bearing_x = (
+        np.cos(previous_latitude) * np.sin(latitude)
+        - np.sin(previous_latitude)
+        * np.cos(latitude)
+        * np.cos(delta_longitude)
+    )
+    bearing = np.arctan2(bearing_y, bearing_x)
+    reported_heading = np.radians(ordered["heading"])
+    heading_alignment = np.cos(bearing - reported_heading)
+    velocity_vector_error_squared = (
+        position_change_mps**2
+        + ordered["velocity"] ** 2
+        - 2
+        * position_change_mps
+        * ordered["velocity"]
+        * heading_alignment
+    )
+    moving_forward = heading_alignment > 0
 
-    # Reject a path if its average ground speed over any ten-second interval
-    # exceeds the allowed position-change rate.
-    position_violation = position_change_mps > MAX_POSITION_CHANGE_MPS
+    # Allow the maximum speed change over the interval when comparing the
+    # position-derived velocity with the reported velocity vector. Compare
+    # squared magnitudes to avoid a square root for every row.
+    velocity_comparison_tolerance_mps = (
+        MAX_VELOCITY_CHANGE_MPS_PER_SECOND * elapsed_seconds
+    )
+    position_violation = elapsed_seconds.notna() & (
+        (position_change_mps > MAX_POSITION_CHANGE_MPS)
+        | (
+            velocity_vector_error_squared
+            > velocity_comparison_tolerance_mps**2
+        )
+        | ~moving_forward
+    )
 
     # Compare reported velocities ten seconds apart, normalized by elapsed
     # time, to find implausible average changes in speed.
