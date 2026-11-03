@@ -6,6 +6,7 @@ from typing import TypedDict
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 
 # Run this script from the repository root.
@@ -13,10 +14,15 @@ DEFAULT_INPUT = "adsb/data/history/adsb_trajectory_data.csv"
 DEFAULT_OUTPUT = "machine_learning/data/processed/adsb_trajectory_cleaned.csv"
 MAX_ALTITUDE_M = 30_000
 MAX_VELOCITY_MPS = 400
-MAX_POSITION_CHANGE_MPS = 400
+MAX_DISPLACEMENT_ERROR_FRACTION = 0.25
+MAX_POSITION_ERROR_M = 50
 MAX_VELOCITY_CHANGE_MPS_PER_SECOND = 10
 MAX_ALTITUDE_CHANGE_MPS = 30
+SAMPLE_INTERVAL_SECONDS = 1
 DYNAMIC_CHECK_INTERVAL_SECONDS = 10
+MIN_FLIGHT_GAP_SECONDS = 5
+MIN_FLIGHT_DURATION_MINUTES = 10
+FLIGHT_PATH_OUTPUT_COLUMN = "flight_path_id"
 MIN_HEADING_DEGREES = 0
 MAX_HEADING_DEGREES = 360
 EARTH_RADIUS_M = 6_371_000
@@ -34,10 +40,20 @@ OUTPUT_COLUMNS = [
 class ProcessingReport(TypedDict):
     input_file: Path
     input_rows: int
+    starting_flight_paths: int
     output_rows: int
     remaining_flight_paths: int
+    flight_path_splits_at_start: int
+    flight_path_splits_at_end: int
     dropped_rows: dict[str, int]
     output_path: Path
+
+
+class FlightPathSplitReport(TypedDict):
+    starting_flight_paths: int
+    remaining_flight_paths: int
+    flight_path_splits_at_start: int
+    flight_path_splits_at_end: int
 
 
 def _read_history_file(path: Path) -> pd.DataFrame:
@@ -46,7 +62,216 @@ def _read_history_file(path: Path) -> pd.DataFrame:
     return data[OUTPUT_COLUMNS]
 
 
-def _clean_trajectories(data: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+def _filter_missing_values(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove rows with missing trajectory data or an empty aircraft ID."""
+    missing = data[OUTPUT_COLUMNS].isna().any(axis=1)
+    missing |= data["icao24"].eq("")
+    return data.loc[~missing], int(missing.sum())
+
+
+def _filter_out_of_range_values(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove rows with measurements outside their valid ranges."""
+    out_of_range = (
+        (data["lat"].notna() & ~data["lat"].between(-90, 90))
+        | (data["lon"].notna() & ~data["lon"].between(-180, 180))
+        | (
+            data["geoaltitude"].notna()
+            & ~data["geoaltitude"].between(0, MAX_ALTITUDE_M)
+        )
+        | (
+            data["velocity"].notna()
+            & ~data["velocity"].between(0, MAX_VELOCITY_MPS)
+        )
+        | (
+            data["heading"].notna()
+            & ~data["heading"].between(MIN_HEADING_DEGREES, MAX_HEADING_DEGREES)
+        )
+    )
+    return data.loc[~out_of_range], int(out_of_range.sum())
+
+
+def _split_flight_paths(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Assign a new flight path after each sufficiently long timestamp gap."""
+    ordered = data.sort_values(["icao24", "time"])
+    time_diffs = ordered.groupby("icao24", sort=False)["time"].diff()
+    split_boundary = time_diffs.ge(
+        pd.Timedelta(seconds=MIN_FLIGHT_GAP_SECONDS)
+    )
+    new_path = time_diffs.isna() | split_boundary
+    return (
+        ordered.assign(**{FLIGHT_PATH_OUTPUT_COLUMN: new_path.cumsum()}),
+        int(split_boundary.sum()),
+    )
+
+
+def _filter_short_flight_paths(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove aircraft paths shorter than the minimum duration."""
+    flight_times = data.groupby(FLIGHT_PATH_OUTPUT_COLUMN, sort=False)["time"].agg(
+        ["min", "max"]
+    )
+    short_paths = flight_times.index[
+        flight_times["max"] - flight_times["min"]
+        < pd.Timedelta(minutes=MIN_FLIGHT_DURATION_MINUTES)
+    ]
+    short_path = data[FLIGHT_PATH_OUTPUT_COLUMN].isin(short_paths)
+    return data.loc[~short_path], int(short_path.sum())
+
+
+def _east_north_displacement(
+    latitude_1: NDArray[np.float64],
+    longitude_1: NDArray[np.float64],
+    latitude_2: NDArray[np.float64],
+    longitude_2: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return local east and north displacements in meters."""
+    latitude_1_rad = np.radians(latitude_1)
+    longitude_1_rad = np.radians(longitude_1)
+    latitude_2_rad = np.radians(latitude_2)
+    longitude_2_rad = np.radians(longitude_2)
+    delta_latitude = latitude_2_rad - latitude_1_rad
+    delta_longitude = (
+        (longitude_2_rad - longitude_1_rad + np.pi) % (2 * np.pi)
+    ) - np.pi
+    mean_latitude = (latitude_1_rad + latitude_2_rad) / 2
+    east_displacement_m = (
+        EARTH_RADIUS_M * np.cos(mean_latitude) * delta_longitude
+    )
+    north_displacement_m = EARTH_RADIUS_M * delta_latitude
+    return east_displacement_m, north_displacement_m
+
+
+def _reported_east_north_displacement(
+    velocity_mps: NDArray[np.float64],
+    heading_degrees: NDArray[np.float64],
+    flight_path_ids: NDArray[np.int64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return reported displacement over the configured comparison interval."""
+    heading_radians = np.radians(heading_degrees)
+    components = pd.DataFrame(
+        {
+            FLIGHT_PATH_OUTPUT_COLUMN: flight_path_ids,
+            "velocity_east": velocity_mps * np.sin(heading_radians),
+            "velocity_north": velocity_mps * np.cos(heading_radians),
+        }
+    )
+    grouped = components.groupby(FLIGHT_PATH_OUTPUT_COLUMN, sort=False)
+    east_segments = grouped["velocity_east"].shift(SAMPLE_INTERVAL_SECONDS)
+    north_segments = grouped["velocity_north"].shift(SAMPLE_INTERVAL_SECONDS)
+    east_displacement = (
+        east_segments.groupby(components[FLIGHT_PATH_OUTPUT_COLUMN], sort=False)
+        .rolling(
+            window=DYNAMIC_CHECK_INTERVAL_SECONDS,
+            min_periods=DYNAMIC_CHECK_INTERVAL_SECONDS,
+        )
+        .sum()
+        .reset_index(level=0, drop=True)
+        .reindex(components.index)
+    )
+    north_displacement = (
+        north_segments.groupby(components[FLIGHT_PATH_OUTPUT_COLUMN], sort=False)
+        .rolling(
+            window=DYNAMIC_CHECK_INTERVAL_SECONDS,
+            min_periods=DYNAMIC_CHECK_INTERVAL_SECONDS,
+        )
+        .sum()
+        .reset_index(level=0, drop=True)
+        .reindex(components.index)
+    )
+    return (
+        east_displacement.to_numpy(dtype=float),
+        north_displacement.to_numpy(dtype=float),
+    )
+
+
+def _relative_displacement_error(
+    actual_east_displacement_m: NDArray[np.float64],
+    actual_north_displacement_m: NDArray[np.float64],
+    reported_east_displacement_m: NDArray[np.float64],
+    reported_north_displacement_m: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return absolute vector error in meters and its fraction of actual motion."""
+    actual_distance_m = np.hypot(
+        actual_east_displacement_m, actual_north_displacement_m
+    )
+    error_distance_m = np.hypot(
+        actual_east_displacement_m
+        - reported_east_displacement_m,
+        actual_north_displacement_m
+        - reported_north_displacement_m,
+    )
+    relative_error = np.divide(
+        error_distance_m,
+        actual_distance_m,
+        out=np.where(error_distance_m == 0, 0.0, np.inf),
+        where=actual_distance_m != 0,
+    )
+    return error_distance_m, relative_error
+
+
+def _position_change_violations(ordered: pd.DataFrame) -> pd.Series:
+    """Return rows whose displacement error exceeds both configured limits."""
+    grouped = ordered.groupby(FLIGHT_PATH_OUTPUT_COLUMN, sort=False)
+    elapsed_seconds = (
+        ordered["time"] - grouped["time"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
+    ).dt.total_seconds()
+    check_interval = elapsed_seconds.eq(DYNAMIC_CHECK_INTERVAL_SECONDS)
+
+    actual_east, actual_north = _east_north_displacement(
+        grouped["lat"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS).to_numpy(dtype=float),
+        grouped["lon"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS).to_numpy(dtype=float),
+        ordered["lat"].to_numpy(dtype=float),
+        ordered["lon"].to_numpy(dtype=float),
+    )
+    reported_east, reported_north = _reported_east_north_displacement(
+        ordered["velocity"].to_numpy(dtype=float),
+        ordered["heading"].to_numpy(dtype=float),
+        ordered[FLIGHT_PATH_OUTPUT_COLUMN].to_numpy(dtype=np.int64),
+    )
+    position_error_m, relative_error = _relative_displacement_error(
+        actual_east,
+        actual_north,
+        reported_east,
+        reported_north,
+    )
+    return check_interval & (
+        (position_error_m > MAX_POSITION_ERROR_M)
+        & (relative_error > MAX_DISPLACEMENT_ERROR_FRACTION)
+    )
+
+
+def _velocity_change_violations(ordered: pd.DataFrame) -> pd.Series:
+    """Return rows whose average velocity change exceeds the configured limit."""
+    grouped = ordered.groupby(FLIGHT_PATH_OUTPUT_COLUMN, sort=False)
+    elapsed_seconds = (
+        ordered["time"] - grouped["time"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
+    ).dt.total_seconds()
+    velocity_change = (
+        grouped["velocity"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs()
+        / elapsed_seconds
+    )
+    return elapsed_seconds.eq(DYNAMIC_CHECK_INTERVAL_SECONDS) & (
+        velocity_change > MAX_VELOCITY_CHANGE_MPS_PER_SECOND
+    )
+
+
+def _altitude_change_violations(ordered: pd.DataFrame) -> pd.Series:
+    """Return rows whose average altitude change exceeds the configured limit."""
+    grouped = ordered.groupby(FLIGHT_PATH_OUTPUT_COLUMN, sort=False)
+    elapsed_seconds = (
+        ordered["time"] - grouped["time"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
+    ).dt.total_seconds()
+    altitude_change = (
+        grouped["geoaltitude"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs()
+        / elapsed_seconds
+    )
+    return elapsed_seconds.eq(DYNAMIC_CHECK_INTERVAL_SECONDS) & (
+        altitude_change > MAX_ALTITUDE_CHANGE_MPS
+    )
+
+
+def _clean_trajectories(
+    data: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int], FlightPathSplitReport]:
     """Clean trajectories and count discarded rows by their first failing rule."""
     cleaned = data[OUTPUT_COLUMNS].copy()
 
@@ -59,174 +284,59 @@ def _clean_trajectories(data: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int
 
     # Apply checks in order so each rejected row is counted under one reason.
     dropped = {
-        "invalid_time_or_aircraft_id": 0,
-        "latitude_out_of_range_or_missing": 0,
-        "longitude_out_of_range_or_missing": 0,
-        "geoaltitude_out_of_range_or_missing": 0,
-        "velocity_out_of_range_or_missing": 0,
-        "heading_out_of_range_or_missing": 0,
-        "incomplete_flight_path": 0,
+        "missing_values": 0,
+        "out_of_range_values": 0,
         "position_change_exceeds_threshold": 0,
         "velocity_change_exceeds_threshold": 0,
         "altitude_change_exceeds_threshold": 0,
+        "flight_path_too_short": 0,
     }
 
-    # Require a valid timestamp and a non-empty aircraft identifier before
-    # grouping rows into flight paths.
-    valid_identity = cleaned["time"].notna() & cleaned["icao24"].notna()
-    valid_identity &= cleaned["icao24"].ne("")
-    dropped["invalid_time_or_aircraft_id"] = int((~valid_identity).sum())
-    cleaned = cleaned.loc[valid_identity]
+    cleaned, dropped["missing_values"] = _filter_missing_values(cleaned)
+    cleaned, dropped["out_of_range_values"] = _filter_out_of_range_values(cleaned)
 
-    # Keep only geographic latitudes within the valid range.
-    latitude_valid = cleaned["lat"].notna() & cleaned["lat"].between(-90, 90)
-    dropped["latitude_out_of_range_or_missing"] = int((~latitude_valid).sum())
-    cleaned = cleaned.loc[latitude_valid]
+    # Sort and group the remaining paths for dynamic checks over the configured
+    # comparison interval.
+    ordered, start_split_count = _split_flight_paths(cleaned)
+    starting_flight_paths = int(ordered[FLIGHT_PATH_OUTPUT_COLUMN].nunique())
+    position_violation = _position_change_violations(ordered)
+    velocity_violation = _velocity_change_violations(ordered)
+    altitude_violation = _altitude_change_violations(ordered)
 
-    # Keep only geographic longitudes within the valid range.
-    longitude_valid = cleaned["lon"].notna() & cleaned["lon"].between(-180, 180)
-    dropped["longitude_out_of_range_or_missing"] = int((~longitude_valid).sum())
-    cleaned = cleaned.loc[longitude_valid]
-
-    # Require altitude to be present and between ground level and the configured
-    # maximum flight altitude.
-    geoaltitude_valid = cleaned["geoaltitude"].notna() & cleaned[
-        "geoaltitude"
-    ].between(0, MAX_ALTITUDE_M)
-    dropped["geoaltitude_out_of_range_or_missing"] = int(
-        (~geoaltitude_valid).sum()
+    # Drop only the row that violates a dynamic rule. Count overlapping
+    # failures under the first rule so the reason totals remain exclusive.
+    position_rows = position_violation.fillna(False)
+    velocity_rows = velocity_violation.fillna(False) & ~position_rows
+    altitude_rows = (
+        altitude_violation.fillna(False) & ~position_rows & ~velocity_rows
     )
-    cleaned = cleaned.loc[geoaltitude_valid]
+    dropped["position_change_exceeds_threshold"] = int(position_rows.sum())
+    dropped["velocity_change_exceeds_threshold"] = int(velocity_rows.sum())
+    dropped["altitude_change_exceeds_threshold"] = int(altitude_rows.sum())
 
-    # Require a present, non-negative velocity no greater than the configured
-    # maximum.
-    velocity_valid = cleaned["velocity"].between(0, MAX_VELOCITY_MPS)
-    dropped["velocity_out_of_range_or_missing"] = int((~velocity_valid).sum())
-    cleaned = cleaned.loc[velocity_valid]
+    dynamic_row = position_rows | velocity_rows | altitude_rows
+    cleaned = cleaned.loc[
+        ~dynamic_row.reindex(cleaned.index, fill_value=False)
+    ]
 
-    # Keep headings within the inclusive compass range.
-    heading_valid = cleaned["heading"].between(
-        MIN_HEADING_DEGREES, MAX_HEADING_DEGREES
-    )
-    dropped["heading_out_of_range_or_missing"] = int((~heading_valid).sum())
-    cleaned = cleaned.loc[heading_valid]
-
-    # Check timestamp continuity in chronological order for each aircraft.
-    # If any adjacent samples are not exactly one second apart, reject every
-    # row in that flight path rather than leaving a partial trajectory.
-    ordered = cleaned.sort_values(["icao24", "time"])
-    time_diffs = ordered.groupby("icao24", sort=False)["time"].diff()
-    incomplete_icao24 = ordered.loc[
-        time_diffs.notna() & time_diffs.ne(pd.Timedelta(seconds=1)), "icao24"
-    ].unique()
-    incomplete_path = cleaned["icao24"].isin(incomplete_icao24)
-    dropped["incomplete_flight_path"] = int(incomplete_path.sum())
-    cleaned = cleaned.loc[~incomplete_path]
-
-    # Sort and group the remaining complete paths so dynamic changes can be
-    # compared over each ten-second interval for the same aircraft.
-    ordered = cleaned.sort_values(["icao24", "time"])
-    grouped = ordered.groupby("icao24", sort=False)
-    interval_time = grouped["time"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
-    elapsed_seconds = (ordered["time"] - interval_time).dt.total_seconds()
-
-    # Compare each point with the position ten seconds earlier. Convert
-    # coordinates to radians and use haversine distance over Earth's surface.
-    previous_latitude = np.radians(
-        grouped["lat"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
-    )
-    previous_longitude = np.radians(
-        grouped["lon"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
-    )
-    latitude = np.radians(ordered["lat"])
-    longitude = np.radians(ordered["lon"])
-    delta_latitude = latitude - previous_latitude
-    delta_longitude = longitude - previous_longitude
-    haversine = (
-        np.sin(delta_latitude / 2) ** 2
-        + np.cos(previous_latitude)
-        * np.cos(latitude)
-        * np.sin(delta_longitude / 2) ** 2
-    )
-    position_change_mps = (
-        2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(np.clip(haversine, 0, 1)))
-    ) / elapsed_seconds
-    bearing_y = np.sin(delta_longitude) * np.cos(latitude)
-    bearing_x = (
-        np.cos(previous_latitude) * np.sin(latitude)
-        - np.sin(previous_latitude)
-        * np.cos(latitude)
-        * np.cos(delta_longitude)
-    )
-    bearing = np.arctan2(bearing_y, bearing_x)
-    reported_heading = np.radians(ordered["heading"])
-    heading_alignment = np.cos(bearing - reported_heading)
-    velocity_vector_error_squared = (
-        position_change_mps**2
-        + ordered["velocity"] ** 2
-        - 2
-        * position_change_mps
-        * ordered["velocity"]
-        * heading_alignment
-    )
-    moving_forward = heading_alignment > 0
-
-    # Allow the maximum speed change over the interval when comparing the
-    # position-derived velocity with the reported velocity vector. Compare
-    # squared magnitudes to avoid a square root for every row.
-    velocity_comparison_tolerance_mps = (
-        MAX_VELOCITY_CHANGE_MPS_PER_SECOND * elapsed_seconds
-    )
-    position_violation = elapsed_seconds.notna() & (
-        (position_change_mps > MAX_POSITION_CHANGE_MPS)
-        | (
-            velocity_vector_error_squared
-            > velocity_comparison_tolerance_mps**2
-        )
-        | ~moving_forward
+    # Re-segment after row-level filtering, then remove only short segments.
+    cleaned, end_split_count = _split_flight_paths(cleaned)
+    cleaned, dropped["flight_path_too_short"] = _filter_short_flight_paths(
+        cleaned
     )
 
-    # Compare reported velocities ten seconds apart, normalized by elapsed
-    # time, to find implausible average changes in speed.
-    velocity_change_mps_per_second = (
-        grouped["velocity"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs()
-        / elapsed_seconds
+    return (
+        cleaned.reset_index(drop=True),
+        dropped,
+        {
+            "starting_flight_paths": starting_flight_paths,
+            "remaining_flight_paths": int(
+                cleaned[FLIGHT_PATH_OUTPUT_COLUMN].nunique()
+            ),
+            "flight_path_splits_at_start": start_split_count,
+            "flight_path_splits_at_end": end_split_count,
+        },
     )
-    velocity_violation = (
-        velocity_change_mps_per_second
-        > MAX_VELOCITY_CHANGE_MPS_PER_SECOND
-    )
-
-    # Compare altitudes ten seconds apart, normalized by elapsed time, to find
-    # implausible average vertical rates of change.
-    altitude_change_mps = (
-        grouped["geoaltitude"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs()
-        / elapsed_seconds
-    )
-    altitude_violation = altitude_change_mps > MAX_ALTITUDE_CHANGE_MPS
-
-    # Identify paths with a violation of each dynamic rule. If a path violates
-    # multiple rules, count it under its first failing rule so drop counts stay
-    # exclusive and sum to the number of rows removed by dynamic filtering.
-    position_icao24 = ordered.loc[position_violation, "icao24"].unique()
-    velocity_icao24 = ordered.loc[velocity_violation, "icao24"].unique()
-    altitude_icao24 = ordered.loc[altitude_violation, "icao24"].unique()
-
-    position_path = cleaned["icao24"].isin(position_icao24)
-    velocity_path = cleaned["icao24"].isin(velocity_icao24) & ~position_path
-    altitude_path = (
-        cleaned["icao24"].isin(altitude_icao24)
-        & ~position_path
-        & ~velocity_path
-    )
-    dropped["position_change_exceeds_threshold"] = int(position_path.sum())
-    dropped["velocity_change_exceeds_threshold"] = int(velocity_path.sum())
-    dropped["altitude_change_exceeds_threshold"] = int(altitude_path.sum())
-
-    dynamic_path = position_path | velocity_path | altitude_path
-    cleaned = cleaned.loc[~dynamic_path]
-
-    return cleaned.reset_index(drop=True), dropped
 
 
 def process_data(input_location: str, output_location: str) -> ProcessingReport:
@@ -241,15 +351,22 @@ def process_data(input_location: str, output_location: str) -> ProcessingReport:
 
     data = _read_history_file(input_file)
     input_rows = len(data)
-    cleaned, dropped_rows = _clean_trajectories(data)
+    cleaned, dropped_rows, flight_path_report = _clean_trajectories(data)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cleaned.to_csv(output_path, index=False)
     return {
         "input_file": input_file,
         "input_rows": input_rows,
+        "starting_flight_paths": flight_path_report["starting_flight_paths"],
         "output_rows": len(cleaned),
-        "remaining_flight_paths": int(cleaned["icao24"].nunique()),
+        "remaining_flight_paths": flight_path_report["remaining_flight_paths"],
+        "flight_path_splits_at_start": flight_path_report[
+            "flight_path_splits_at_start"
+        ],
+        "flight_path_splits_at_end": flight_path_report[
+            "flight_path_splits_at_end"
+        ],
         "dropped_rows": dropped_rows,
         "output_path": output_path,
     }
@@ -274,7 +391,19 @@ def main() -> None:
     report = process_data(args.input, args.output)
     print(f"Read {report['input_rows']} rows from {report['input_file']}.")
     print(f"\nWrote {report['output_rows']} rows to {report['output_path']}.")
-    print(f"\nRemaining full flight paths: {report['remaining_flight_paths']}.")
+    print(f"\nStarting flight paths: {report['starting_flight_paths']}.")
+    print(
+        "Flight path splits at start: "
+        f"{report['flight_path_splits_at_start']}."
+    )
+    print(
+        "Flight path splits at end: "
+        f"{report['flight_path_splits_at_end']}."
+    )
+    print(
+        f"\nRemaining flight paths of at least {MIN_FLIGHT_DURATION_MINUTES} minutes: "
+        f"{report['remaining_flight_paths']}."
+    )
     print("\nRows dropped (each row counted under its first failing reason):")
     for reason, count in report["dropped_rows"].items():
         print(f"  {reason.replace('_', ' ')}: {count}")
