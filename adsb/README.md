@@ -57,3 +57,47 @@ python adsb/src/download_adsb.py --config path/to/your-config.yaml
 ```
 
 The output directory is created automatically when the query returns data.
+
+## Filter by ICAO24
+
+Extract rows for one aircraft from the history CSV:
+
+```powershell
+python adsb/src/filter_icao24.py --icao24 ABC123
+```
+
+The address must be six hexadecimal characters. By default, the script reads
+`adsb/data/history/adsb_trajectory_data.csv` and writes matching rows to a
+similarly named CSV beside it, such as
+`adsb_trajectory_data_icao24_ABC123.csv`. You can specify different paths with
+`--input` and `--output`:
+
+```powershell
+python adsb/src/filter_icao24.py --icao24 ABC123 --input path/to/input.csv --output path/to/filtered.csv
+```
+
+## Export MATLAB waypoints
+
+Convert an extracted aircraft CSV into a MATLAB-ready waypoint CSV:
+
+```powershell
+python adsb/src/convert_adsb_waypoints.py `
+  --input adsb/data/history/adsb_trajectory_data_icao24_A733DD.csv
+```
+
+By default, the output is written beside the input with `_waypoints` appended
+to its name. Each row has a UTC timestamp, elapsed arrival time in seconds,
+latitude and longitude in degrees, and geometric altitude in meters. Rows
+missing coordinates or geometric altitude are skipped and counted in the
+script's output. To choose another output path, add
+`--output path/to/waypoints.csv`.
+
+In MATLAB, load the waypoint CSV and create the trajectory:
+
+```matlab
+waypointData = readtable("adsb_trajectory_data_icao24_A733DD_waypoints.csv");
+waypoints = [waypointData.latitude_deg, waypointData.longitude_deg, ...
+    waypointData.altitude_m];
+timeOfArrival = waypointData.time_of_arrival_s;
+trajectory = geoTrajectory(waypoints, timeOfArrival);
+```
