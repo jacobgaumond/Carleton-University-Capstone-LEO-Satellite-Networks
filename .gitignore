@@ -2,5 +2,6 @@
 credentials.json
 settings.conf
 */data/
-adsb/config.yaml
+config/config.yaml
+out/
 *.pyc

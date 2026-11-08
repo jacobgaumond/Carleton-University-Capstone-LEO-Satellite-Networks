@@ -1,6 +1,6 @@
 # ADS-B history downloader
 
-`src/download_adsb.py` downloads aircraft trajectory data from the OpenSky
+`python/src/adsb/download_adsb.py` downloads aircraft trajectory data from the OpenSky
 historical database. The date range, geographic bounds, and output path are
 read from a YAML configuration file.
 
@@ -12,9 +12,7 @@ Install the project dependencies from the repository root:
 python -m pip install -r requirements.txt
 ```
 
-Copy `config.example.yaml` to `config.yaml`, then edit the values for the
-download you need. The real `config.yaml` is ignored by Git so local download
-settings do not get committed.
+Copy `config/config.example.yaml` to `config/config.yaml` (the default config file path), then edit the values for the download you need. Note that `config/config.yaml` is ignored by Git so that local download settings do not get committed.
 
 ## Configuration
 
@@ -24,7 +22,7 @@ settings do not get committed.
 | `end_time` | Query end as a timezone-aware ISO 8601 timestamp, after `start_time`. |
 | `min_lat`, `max_lat` | Latitude bounds, with `-90 <= min_lat < max_lat <= 90`. |
 | `min_lon`, `max_lon` | Longitude bounds, with `-180 <= min_lon < max_lon <= 180`. |
-| `output_file` | CSV destination; relative paths are resolved from the config file's directory. |
+| `output_file` | CSV destination; relative paths are resolved from the `out/` directory. |
 
 Quote timestamps in YAML to keep them as strings, and include a timezone offset
 such as `+00:00`. OpenSky request chunking uses PyOpenSky's default (one hour).
