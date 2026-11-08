@@ -1,5 +1,5 @@
 % extract data from preprocessed csv
-T = readtable("..\adsb\data\history\adsb_trajectory_data_icao24_A733DD_waypoints.csv");
+T = readtable("..\out\adsb\data\history\adsb_trajectory_data_icao24_A733DD_waypoints.csv");
 timestamps = datetime(T.timestamp_utc, ...
     "InputFormat", "yyyy-MM-dd'T'HH:mm:ss'Z'", ...
     "TimeZone", "UTC");
