@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 # Run this script from the repository root.
 ROOT_DIR_PATH = Path(__file__).resolve().parent.parent.parent.parent
 DEFAULT_INPUT = ROOT_DIR_PATH / "out" / "adsb/data/history/adsb_trajectory_data.csv"
-DEFAULT_OUTPUT = ROOT_DIR_PATH / "out" / "machine_learning/data/processed/adsb_trajectory_cleaned.csv"
+DEFAULT_OUTPUT = ROOT_DIR_PATH / "out" / "ml/data/processed/adsb_trajectory_data_cleaned.csv"
 MAX_ALTITUDE_M = 30_000
 MAX_VELOCITY_MPS = 400
 MAX_DISPLACEMENT_ERROR_FRACTION = 0.25
