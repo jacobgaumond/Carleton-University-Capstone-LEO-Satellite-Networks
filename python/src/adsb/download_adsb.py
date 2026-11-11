@@ -10,8 +10,9 @@ from typing import Any
 import yaml
 from pyopensky.trino import Trino
 
-
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
+ROOT_DIR_PATH           = Path(__file__).resolve().parent.parent.parent.parent
+DEFAULT_OUTPUT_DIR_PATH = ROOT_DIR_PATH / "out"
+DEFAULT_CONFIG_PATH     = ROOT_DIR_PATH / "config" / "config.yaml"
 REQUIRED_CONFIG_KEYS = {
     "start_time",
     "end_time",
@@ -96,7 +97,7 @@ def _load_config(config_path: Path) -> DownloadConfig:
         raise ValueError("Config 'output_file' must be a non-empty path string.")
     output_file = Path(output_file_value)
     if not output_file.is_absolute():
-        output_file = config_path.resolve().parent / output_file
+        output_file = DEFAULT_OUTPUT_DIR_PATH / output_file
 
     return DownloadConfig(
         start_time=start_time,
@@ -116,8 +117,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
-        help=f"YAML config path (default: {DEFAULT_CONFIG}).",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"YAML config path (default: {DEFAULT_CONFIG_PATH}).",
     )
     args = parser.parse_args()
     config = _load_config(args.config)

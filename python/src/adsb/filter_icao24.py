@@ -6,12 +6,8 @@ import re
 from pathlib import Path
 
 
-DEFAULT_INPUT = (
-    Path(__file__).resolve().parent.parent
-    / "data"
-    / "history"
-    / "adsb_trajectory_data.csv"
-)
+ROOT_DIR_PATH = Path(__file__).resolve().parent.parent.parent.parent
+DEFAULT_INPUT = ROOT_DIR_PATH / "out" / "adsb/data/history/adsb_trajectory_data.csv"
 
 
 def _parse_icao24(value: str) -> str:

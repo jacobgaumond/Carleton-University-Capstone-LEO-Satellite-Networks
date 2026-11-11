@@ -1,6 +1,6 @@
 # ADS-B history downloader
 
-`src/download_adsb.py` downloads aircraft trajectory data from the OpenSky
+`python/src/adsb/download_adsb.py` downloads aircraft trajectory data from the OpenSky
 historical database. The date range, geographic bounds, and output path are
 read from a YAML configuration file.
 
@@ -12,9 +12,7 @@ Install the project dependencies from the repository root:
 python -m pip install -r requirements.txt
 ```
 
-Copy `config.example.yaml` to `config.yaml`, then edit the values for the
-download you need. The real `config.yaml` is ignored by Git so local download
-settings do not get committed.
+Copy `config/config.example.yaml` to `config/config.yaml` (the default config file path), then edit the values for the download you need. Note that `config/config.yaml` is ignored by Git so that local download settings do not get committed.
 
 ## Configuration
 
@@ -24,7 +22,7 @@ settings do not get committed.
 | `end_time` | Query end as a timezone-aware ISO 8601 timestamp, after `start_time`. |
 | `min_lat`, `max_lat` | Latitude bounds, with `-90 <= min_lat < max_lat <= 90`. |
 | `min_lon`, `max_lon` | Longitude bounds, with `-180 <= min_lon < max_lon <= 180`. |
-| `output_file` | CSV destination; relative paths are resolved from the config file's directory. |
+| `output_file` | CSV destination; relative paths are resolved from the `out/` directory. |
 
 Quote timestamps in YAML to keep them as strings, and include a timezone offset
 such as `+00:00`. OpenSky request chunking uses PyOpenSky's default (one hour).
@@ -44,45 +42,47 @@ such as `+00:00`. OpenSky request chunking uses PyOpenSky's default (one hour).
 
 ## Run
 
-From the repository root, using the default `adsb/config.yaml`:
+From the repository root, using the default `config/config.yaml`:
 
 ```powershell
-python adsb/src/download_adsb.py
+python python/src/adsb/download_adsb.py
 ```
 
 To use a different config file:
 
 ```powershell
-python adsb/src/download_adsb.py --config path/to/your-config.yaml
+python python/src/adsb/download_adsb.py --config path/to/your-config.yaml
 ```
 
 The output directory is created automatically when the query returns data.
 
-## Filter by ICAO24
+## Related scripts
 
-Extract rows for one aircraft from the history CSV:
+### Filter by ICAO24
+
+`python/src/adsb/filter_icao24.py` extracts rows for one aircraft from the history CSV:
 
 ```powershell
-python adsb/src/filter_icao24.py --icao24 ABC123
+python python/src/adsb/filter_icao24.py --icao24 ABC123
 ```
 
 The address must be six hexadecimal characters. By default, the script reads
-`adsb/data/history/adsb_trajectory_data.csv` and writes matching rows to a
+`out/adsb/data/history/adsb_trajectory_data.csv` and writes matching rows to a
 similarly named CSV beside it, such as
 `adsb_trajectory_data_icao24_ABC123.csv`. You can specify different paths with
 `--input` and `--output`:
 
 ```powershell
-python adsb/src/filter_icao24.py --icao24 ABC123 --input path/to/input.csv --output path/to/filtered.csv
+python python/src/adsb/filter_icao24.py --icao24 ABC123 --input path/to/input.csv --output path/to/filtered.csv
 ```
 
-## Export MATLAB waypoints
+### Export MATLAB waypoints
 
-Convert an extracted aircraft CSV into a MATLAB-ready waypoint CSV:
+`python/src/adsb/convert_adsb_waypoints.py` converts an extracted aircraft CSV into a MATLAB-ready waypoint CSV:
 
 ```powershell
-python adsb/src/convert_adsb_waypoints.py `
-  --input adsb/data/history/adsb_trajectory_data_icao24_A733DD.csv
+python python/src/adsb/convert_adsb_waypoints.py `
+  --input out/adsb/data/history/adsb_trajectory_data_icao24_A733DD.csv
 ```
 
 By default, the output is written beside the input with `_waypoints` appended
