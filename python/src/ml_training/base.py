@@ -6,7 +6,9 @@ ROOT_DIR_PATH               = Path(__file__).resolve().parent.parent.parent.pare
 DEFAULT_INPUT_PARENT_PATH   = ROOT_DIR_PATH / "out" / "ml/data/processed"
 DEFAULT_INPUT_FILENAME      = "adsb_trajectory_data_cleaned.csv"
 
+# Note: If modifying NUMPY_FLOAT_DATA_TYPE, you should also modifying the Tensor `dtype` used the function `tensor_list_from_ads_b_df`
 NUMPY_FLOAT_DATA_TYPE = "float32" # The lat, lon, geoaltitude, velocity, and heading are typecasted from float64, as its unsupported for MPS Tensors; we can experiment with non-MPS and float64 later, if needed.
+FEATURE_COLS = ["time_diff", "lat", "lon", "geoaltitude", "velocity", "heading"]
 
 # Setup hardware device
 
@@ -81,3 +83,16 @@ def clean_ads_b_df(input_df: pd.DataFrame) -> pd.DataFrame:
     output_df["heading"] = output_df["heading"].astype(NUMPY_FLOAT_DATA_TYPE)
 
     return output_df
+
+def tensor_list_from_ads_b_df(df: pd.DataFrame) -> list[torch.tensor]:
+    """
+    Takes an input DataFrame of processed & cleaned ADS-B data, and unpackages it into a list of tensors (where
+    each tensor represents data from a distinct flight path) for ML training.
+    """
+
+    tensor_list = [
+        torch.tensor(flight_path_df[FEATURE_COLS].to_numpy(dtype=NUMPY_FLOAT_DATA_TYPE), dtype=torch.float32) \
+            for _, flight_path_df in df.groupby("flight_path_id", sort=False)
+    ]
+
+    return tensor_list
