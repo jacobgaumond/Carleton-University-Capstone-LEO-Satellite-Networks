@@ -6,6 +6,8 @@ ROOT_DIR_PATH               = Path(__file__).resolve().parent.parent.parent.pare
 DEFAULT_INPUT_PARENT_PATH   = ROOT_DIR_PATH / "out" / "ml/data/processed"
 DEFAULT_INPUT_FILENAME      = "adsb_trajectory_data_cleaned.csv"
 
+NUMPY_FLOAT_DATA_TYPE = "float32" # The lat, lon, geoaltitude, velocity, and heading are typecasted from float64, as its unsupported for MPS Tensors; we can experiment with non-MPS and float64 later, if needed.
+
 # Setup hardware device
 
 if torch.cuda.is_available():
@@ -48,7 +50,7 @@ def clean_ads_b_df(input_df: pd.DataFrame) -> pd.DataFrame:
         .diff()
         .dt.total_seconds()
         .fillna(0.0)
-        .astype("float32")
+        .astype(NUMPY_FLOAT_DATA_TYPE)
     )
     cols_to_drop += ["time"]
 
@@ -70,12 +72,12 @@ def clean_ads_b_df(input_df: pd.DataFrame) -> pd.DataFrame:
 
     output_df = output_df[col_list]
 
-    # Set all non-ID data to floats (for training)
-    # output_df["time_diff"] = output_df["time_diff"].astype("float32") # Already done (above)
-    output_df["lat"] = output_df["lat"].astype("float64")
-    output_df["lon"] = output_df["lon"].astype("float64")
-    output_df["geoaltitude"] = output_df["geoaltitude"].astype("float64")
-    output_df["velocity"] = output_df["velocity"].astype("float64")
-    output_df["heading"] = output_df["heading"].astype("float64")
+    # Set all non-ID data (i.e., data for feature columns) to the same float type (for training)
+    # output_df["time_diff"] = output_df["time_diff"].astype(NUMPY_FLOAT_DATA_TYPE) # Already done (above)
+    output_df["lat"] = output_df["lat"].astype(NUMPY_FLOAT_DATA_TYPE)
+    output_df["lon"] = output_df["lon"].astype(NUMPY_FLOAT_DATA_TYPE)
+    output_df["geoaltitude"] = output_df["geoaltitude"].astype(NUMPY_FLOAT_DATA_TYPE)
+    output_df["velocity"] = output_df["velocity"].astype(NUMPY_FLOAT_DATA_TYPE)
+    output_df["heading"] = output_df["heading"].astype(NUMPY_FLOAT_DATA_TYPE)
 
     return output_df
