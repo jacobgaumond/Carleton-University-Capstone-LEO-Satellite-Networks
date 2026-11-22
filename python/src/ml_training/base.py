@@ -84,7 +84,7 @@ def clean_ads_b_df(input_df: pd.DataFrame) -> pd.DataFrame:
 
     return output_df
 
-def tensor_list_from_ads_b_df(df: pd.DataFrame) -> list[torch.tensor]:
+def tensor_list_from_ads_b_df(df: pd.DataFrame) -> list[torch.Tensor]:
     """
     Takes an input DataFrame of processed & cleaned ADS-B data, and unpackages it into a list of tensors (where
     each tensor represents data from a distinct flight path) for ML training.
