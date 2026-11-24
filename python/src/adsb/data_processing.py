@@ -8,11 +8,16 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-
 # Run this script from the repository root.
 ROOT_DIR_PATH = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_INPUT = ROOT_DIR_PATH / "out" / "adsb/data/history/adsb_trajectory_data.csv"
-DEFAULT_OUTPUT = ROOT_DIR_PATH / "out" / "ml/data/processed/adsb_trajectory_data_cleaned.csv"
+DEFAULT_INPUT = (
+    ROOT_DIR_PATH / "out" / "adsb/data/history/held_out_adsb_trajectory_data.csv"
+)
+DEFAULT_OUTPUT = (
+    ROOT_DIR_PATH
+    / "out"
+    / "ml/data/processed/held_out_adsb_trajectory_data_cleaned.csv"
+)
 MAX_ALTITUDE_M = 30_000
 MAX_VELOCITY_MPS = 400
 MAX_DISPLACEMENT_ERROR_FRACTION = 0.25
@@ -79,10 +84,7 @@ def _filter_out_of_range_values(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             data["geoaltitude"].notna()
             & ~data["geoaltitude"].between(0, MAX_ALTITUDE_M)
         )
-        | (
-            data["velocity"].notna()
-            & ~data["velocity"].between(0, MAX_VELOCITY_MPS)
-        )
+        | (data["velocity"].notna() & ~data["velocity"].between(0, MAX_VELOCITY_MPS))
         | (
             data["heading"].notna()
             & ~data["heading"].between(MIN_HEADING_DEGREES, MAX_HEADING_DEGREES)
@@ -95,9 +97,7 @@ def _split_flight_paths(data: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Assign a new flight path after each sufficiently long timestamp gap."""
     ordered = data.sort_values(["icao24", "time"])
     time_diffs = ordered.groupby("icao24", sort=False)["time"].diff()
-    split_boundary = time_diffs.ge(
-        pd.Timedelta(seconds=MIN_FLIGHT_GAP_SECONDS)
-    )
+    split_boundary = time_diffs.ge(pd.Timedelta(seconds=MIN_FLIGHT_GAP_SECONDS))
     new_path = time_diffs.isna() | split_boundary
     return (
         ordered.assign(**{FLIGHT_PATH_OUTPUT_COLUMN: new_path.cumsum()}),
@@ -134,9 +134,7 @@ def _east_north_displacement(
         (longitude_2_rad - longitude_1_rad + np.pi) % (2 * np.pi)
     ) - np.pi
     mean_latitude = (latitude_1_rad + latitude_2_rad) / 2
-    east_displacement_m = (
-        EARTH_RADIUS_M * np.cos(mean_latitude) * delta_longitude
-    )
+    east_displacement_m = EARTH_RADIUS_M * np.cos(mean_latitude) * delta_longitude
     north_displacement_m = EARTH_RADIUS_M * delta_latitude
     return east_displacement_m, north_displacement_m
 
@@ -195,10 +193,8 @@ def _relative_displacement_error(
         actual_east_displacement_m, actual_north_displacement_m
     )
     error_distance_m = np.hypot(
-        actual_east_displacement_m
-        - reported_east_displacement_m,
-        actual_north_displacement_m
-        - reported_north_displacement_m,
+        actual_east_displacement_m - reported_east_displacement_m,
+        actual_north_displacement_m - reported_north_displacement_m,
     )
     relative_error = np.divide(
         error_distance_m,
@@ -247,8 +243,7 @@ def _velocity_change_violations(ordered: pd.DataFrame) -> pd.Series:
         ordered["time"] - grouped["time"].shift(DYNAMIC_CHECK_INTERVAL_SECONDS)
     ).dt.total_seconds()
     velocity_change = (
-        grouped["velocity"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs()
-        / elapsed_seconds
+        grouped["velocity"].diff(DYNAMIC_CHECK_INTERVAL_SECONDS).abs() / elapsed_seconds
     )
     return elapsed_seconds.eq(DYNAMIC_CHECK_INTERVAL_SECONDS) & (
         velocity_change > MAX_VELOCITY_CHANGE_MPS_PER_SECOND
@@ -308,32 +303,24 @@ def _clean_trajectories(
     # failures under the first rule so the reason totals remain exclusive.
     position_rows = position_violation.fillna(False)
     velocity_rows = velocity_violation.fillna(False) & ~position_rows
-    altitude_rows = (
-        altitude_violation.fillna(False) & ~position_rows & ~velocity_rows
-    )
+    altitude_rows = altitude_violation.fillna(False) & ~position_rows & ~velocity_rows
     dropped["position_change_exceeds_threshold"] = int(position_rows.sum())
     dropped["velocity_change_exceeds_threshold"] = int(velocity_rows.sum())
     dropped["altitude_change_exceeds_threshold"] = int(altitude_rows.sum())
 
     dynamic_row = position_rows | velocity_rows | altitude_rows
-    cleaned = cleaned.loc[
-        ~dynamic_row.reindex(cleaned.index, fill_value=False)
-    ]
+    cleaned = cleaned.loc[~dynamic_row.reindex(cleaned.index, fill_value=False)]
 
     # Re-segment after row-level filtering, then remove only short segments.
     cleaned, end_split_count = _split_flight_paths(cleaned)
-    cleaned, dropped["flight_path_too_short"] = _filter_short_flight_paths(
-        cleaned
-    )
+    cleaned, dropped["flight_path_too_short"] = _filter_short_flight_paths(cleaned)
 
     return (
         cleaned.reset_index(drop=True),
         dropped,
         {
             "starting_flight_paths": starting_flight_paths,
-            "remaining_flight_paths": int(
-                cleaned[FLIGHT_PATH_OUTPUT_COLUMN].nunique()
-            ),
+            "remaining_flight_paths": int(cleaned[FLIGHT_PATH_OUTPUT_COLUMN].nunique()),
             "flight_path_splits_at_start": start_split_count,
             "flight_path_splits_at_end": end_split_count,
         },
@@ -365,9 +352,7 @@ def process_data(input_location: str, output_location: str) -> ProcessingReport:
         "flight_path_splits_at_start": flight_path_report[
             "flight_path_splits_at_start"
         ],
-        "flight_path_splits_at_end": flight_path_report[
-            "flight_path_splits_at_end"
-        ],
+        "flight_path_splits_at_end": flight_path_report["flight_path_splits_at_end"],
         "dropped_rows": dropped_rows,
         "output_path": output_path,
     }
@@ -393,14 +378,8 @@ def main() -> None:
     print(f"Read {report['input_rows']} rows from {report['input_file']}.")
     print(f"\nWrote {report['output_rows']} rows to {report['output_path']}.")
     print(f"\nStarting flight paths: {report['starting_flight_paths']}.")
-    print(
-        "Flight path splits at start: "
-        f"{report['flight_path_splits_at_start']}."
-    )
-    print(
-        "Flight path splits at end: "
-        f"{report['flight_path_splits_at_end']}."
-    )
+    print("Flight path splits at start: " f"{report['flight_path_splits_at_start']}.")
+    print("Flight path splits at end: " f"{report['flight_path_splits_at_end']}.")
     print(
         f"\nRemaining flight paths of at least {MIN_FLIGHT_DURATION_MINUTES} minutes: "
         f"{report['remaining_flight_paths']}."

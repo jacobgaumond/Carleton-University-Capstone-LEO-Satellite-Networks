@@ -4,7 +4,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Mapping
+
+from .validation import ForecastMetrics
 
 OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parents[4] / "out" / "ml" / "training_results"
@@ -23,36 +24,6 @@ def _round_float_values(value: object) -> object:
 
 
 @dataclass(frozen=True)
-class DisplacementMetrics:
-    """Horizontal and vertical validation RMSE values in meters."""
-
-    mean_horizontal_rmse_m: float
-    mean_vertical_rmse_m: float
-    mean_east_rmse_m: float
-    mean_north_rmse_m: float
-    final_horizontal_rmse_m: float
-    final_vertical_rmse_m: float
-    final_east_rmse_m: float
-    final_north_rmse_m: float
-    selection_score_m: float
-
-    @classmethod
-    def from_mapping(cls, metrics: Mapping[str, float]) -> "DisplacementMetrics":
-        """Build the typed metric record from validation's metric dictionary."""
-        return cls(
-            mean_horizontal_rmse_m=metrics["mean_horizontal_rmse_m"],
-            mean_vertical_rmse_m=metrics["mean_vertical_rmse_m"],
-            mean_east_rmse_m=metrics["mean_east_rmse_m"],
-            mean_north_rmse_m=metrics["mean_north_rmse_m"],
-            final_horizontal_rmse_m=metrics["final_horizontal_rmse_m"],
-            final_vertical_rmse_m=metrics["final_vertical_rmse_m"],
-            final_east_rmse_m=metrics["final_east_rmse_m"],
-            final_north_rmse_m=metrics["final_north_rmse_m"],
-            selection_score_m=metrics["selection_score_m"],
-        )
-
-
-@dataclass(frozen=True)
 class EpochTrainingResult:
     """Losses and actual-distance metrics collected for one epoch."""
 
@@ -60,16 +31,15 @@ class EpochTrainingResult:
     training_mse: float
     validation_mse_standardized: float
     validation_forecast_count: int
-    displacement_metrics: DisplacementMetrics
+    displacement_metrics: ForecastMetrics
 
 
 @dataclass(frozen=True)
 class TrainingResults:
     """Configuration, environment, and measured outcomes for a training run.
 
-    ``validation_mse_standardized`` records loss across the full forecast
-    horizon. ``best_displacement_metrics`` stores RMSE over that horizon and
-    at its final (300-second, with the current configuration) position.
+    ``best_epoch`` contains the complete per-epoch losses and displacement
+    metrics for the selected epoch.
     """
 
     input_file: Path
@@ -78,7 +48,7 @@ class TrainingResults:
     heldout_examples: int | None
     heldout_forecast_count: int | None
     heldout_mse_standardized: float | None
-    heldout_displacement_metrics: DisplacementMetrics | None
+    heldout_displacement_metrics: ForecastMetrics | None
     started_at_utc: str
     completed_at_utc: str
     duration_seconds: float
@@ -106,12 +76,7 @@ class TrainingResults:
     validation_flight_paths: int
     training_examples: int
     validation_examples: int
-    best_epoch: int
-    best_training_mse: float
-    best_validation_mse_standardized: float
-    best_validation_forecast_count: int
-    best_selection_score_m: float
-    best_displacement_metrics: DisplacementMetrics
+    best_epoch: EpochTrainingResult
     epoch_history: tuple[EpochTrainingResult, ...]
 
 

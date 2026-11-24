@@ -4,40 +4,54 @@ The model uses 120 seconds of history to predict 300 one-second positions direct
 """
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import platform
 from time import perf_counter
 
+from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 # Support both `python -m ml_training.train_lstm` and direct script execution.
 if __package__:
-    from .util.data_loader import create_data_loaders
+    from .util.data_loader import PositionWindows, create_data_loaders
     from .util.device import get_device
     from .util.save_training_results import (
-        DisplacementMetrics,
         EpochTrainingResult,
         TrainingResults,
         save_training_results,
     )
-    from .util.validation import evaluate_validation_loss, validate_displacement
+    from .util.validation import (
+        ForecastMetrics,
+        evaluate_validation_loss,
+        validate_displacement,
+    )
 else:
-    from util.data_loader import create_data_loaders
+    from util.data_loader import PositionWindows, create_data_loaders
     from util.device import get_device
     from util.save_training_results import (
-        DisplacementMetrics,
         EpochTrainingResult,
         TrainingResults,
         save_training_results,
     )
-    from util.validation import evaluate_validation_loss, validate_displacement
+    from util.validation import (
+        ForecastMetrics,
+        evaluate_validation_loss,
+        validate_displacement,
+    )
 
 # Resolve defaults from the repository location, not the current working directory.
 ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_INPUT = (
-    ROOT_DIR / "out" / "ml" / "data" / "processed" / "adsb_trajectory_data_cleaned.csv"
+    ROOT_DIR
+    / "out"
+    / "ml"
+    / "data"
+    / "processed"
+    / "adsb_trajectory_data_cleaned_strict_interpolated.csv"
 )
 DEFAULT_OUTPUT = ROOT_DIR / "out" / "ml" / "models" / "aircraft_lstm.pt"
 DEFAULT_HELDOUT_INPUT = (
@@ -113,6 +127,11 @@ class TrajectoryLSTM(nn.Module):
         Returns:
             Standardized predictions shaped
             ``[batch, forecast_seconds, len(position_columns)]``.
+
+        Notes:
+            Each batch item is processed as an independent history window.
+            Since no initial hidden/cell state is provided, the LSTM starts
+            from zero state; its final state is not carried to later calls.
         """
         sequence, _ = self.lstm(history)
         # The final history output summarizes the sequence; the linear layer
@@ -124,6 +143,161 @@ class TrajectoryLSTM(nn.Module):
             self.forecast_seconds,
             len(self.position_columns),
         )
+
+
+def train_one_epoch(
+    model: nn.Module,
+    training_loader: DataLoader,
+    validation_loader: DataLoader,
+    validation_set: PositionWindows,
+    loss_function: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    position_scaler: StandardScaler,
+    position_columns: list[str],
+    validation_batch_size: int,
+    epoch: int,
+) -> EpochTrainingResult:
+    """Train once and evaluate validation loss and forecast displacement."""
+    model.train()
+    total_loss = 0.0
+    example_count = 0
+    total_batches = len(training_loader)
+    progress_width = 30
+
+    for batch_index, (histories, targets) in enumerate(training_loader, start=1):
+        histories, targets = histories.to(device), targets.to(device)
+        # Clear prior gradients before calculating this batch's update.
+        optimizer.zero_grad()
+        loss = loss_function(model(histories), targets)
+        loss.backward()
+        optimizer.step()
+
+        # Weight batch means by their example counts for an epoch-wide mean.
+        batch_size = len(histories)
+        total_loss += loss.item() * batch_size
+        example_count += batch_size
+
+        completed_width = int(progress_width * batch_index / total_batches)
+        progress_bar = "=" * completed_width + " " * (progress_width - completed_width)
+        current_mse = total_loss / example_count
+        print(
+            f"\rTraining [{progress_bar}] {batch_index}/{total_batches} "
+            f"MSE: {current_mse:.4f}",
+            end="",
+            flush=True,
+        )
+
+    if example_count == 0:
+        raise ValueError("Training loader produced no examples for this epoch.")
+
+    print()
+    training_mse = total_loss / example_count
+
+    # Evaluate both scaled prediction loss and displacement in meters.
+    validation_loss = evaluate_validation_loss(
+        model,
+        validation_loader,
+        loss_function,
+        device,
+        len(validation_set),
+    )
+    forecast_count, forecast_metrics = validate_displacement(
+        model,
+        validation_set,
+        position_scaler,
+        device,
+        position_columns,
+        validation_batch_size,
+    )
+    return EpochTrainingResult(
+        epoch=epoch,
+        training_mse=training_mse,
+        validation_mse_standardized=validation_loss,
+        validation_forecast_count=forecast_count,
+        displacement_metrics=forecast_metrics,
+    )
+
+
+def print_epoch_result(
+    result: EpochTrainingResult,
+    total_epochs: int,
+    forecast_seconds: int,
+) -> None:
+    """Print training loss and validation displacement metrics for one epoch."""
+    metrics = result.displacement_metrics
+    print(
+        f"Epoch {result.epoch}/{total_epochs}: "
+        f"train MSE={result.training_mse:.4f}, "
+        f"direct {forecast_seconds}-second validation "
+        f"MSE={result.validation_mse_standardized:.4f}"
+    )
+    print(
+        f"  Mean over {forecast_seconds} seconds "
+        f"({result.validation_forecast_count} forecasts): "
+        f"horizontal RMSE={metrics.mean_horizontal_rmse_m:.1f} m, "
+        f"vertical RMSE={metrics.mean_vertical_rmse_m:.1f} m "
+        f"(east={metrics.mean_east_rmse_m:.1f} m, "
+        f"north={metrics.mean_north_rmse_m:.1f} m)"
+    )
+    print(
+        f"  At {forecast_seconds} seconds: "
+        f"horizontal RMSE={metrics.final_horizontal_rmse_m:.1f} m, "
+        f"vertical RMSE={metrics.final_vertical_rmse_m:.1f} m "
+        f"(east={metrics.final_east_rmse_m:.1f} m, "
+        f"north={metrics.final_north_rmse_m:.1f} m)"
+    )
+    print(
+        "  Selection score (mean of average horizontal and vertical "
+        f"RMSE): {metrics.selection_score_m:.1f} m"
+    )
+
+
+def save_best_model(
+    model: nn.Module,
+    output_path: Path,
+    best_model_state: dict[str, torch.Tensor],
+    feature_scaler: StandardScaler,
+    position_scaler: StandardScaler,
+    feature_columns: list[str],
+    position_columns: list[str],
+    best_epoch: EpochTrainingResult,
+    forecast_mode: str,
+) -> None:
+    """Restore and save the best checkpoint with its scaling metadata."""
+    if (
+        feature_scaler.mean_ is None
+        or feature_scaler.scale_ is None
+        or position_scaler.mean_ is None
+        or position_scaler.scale_ is None
+    ):
+        raise RuntimeError("Training scalers are not fitted.")
+
+    model.load_state_dict(best_model_state)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": best_model_state,
+            "feature_mean": feature_scaler.mean_.tolist(),
+            "feature_scale": feature_scaler.scale_.tolist(),
+            "position_mean": position_scaler.mean_.tolist(),
+            "position_scale": position_scaler.scale_.tolist(),
+            "feature_columns": feature_columns,
+            "position_columns": position_columns,
+            "best_epoch": best_epoch.epoch,
+            "best_validation_score_m": (
+                best_epoch.displacement_metrics.selection_score_m
+            ),
+            "best_validation_metrics": asdict(best_epoch.displacement_metrics),
+            "forecast_mode": forecast_mode,
+        },
+        output_path,
+    )
+    print(
+        f"Saved best model to {output_path} "
+        f"(epoch {best_epoch.epoch}, "
+        f"score={best_epoch.displacement_metrics.selection_score_m:.1f} m)"
+    )
 
 
 def train(
@@ -169,6 +343,7 @@ def train(
         raise RuntimeError("Training scalers are not fitted.")
 
     device = get_device()
+
     # Create a new model and optimizer for this training run.
     model = TrajectoryLSTM(
         FEATURE_COLUMNS,
@@ -176,147 +351,67 @@ def train(
         FORECAST_SECONDS,
         HIDDEN_SIZE,
     ).to(device)
+
     # Use mean squared error for both training and validation.
     loss_function = nn.MSELoss()
+
     # Use the Adam optimizer to update all model parameters.
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # Lower validation scores indicate better performance, so track the best epoch.
-    best_validation_score = float("inf")
-    best_epoch = 0
-    best_training_mse: float | None = None
-    best_validation_loss: float | None = None
-    best_forecast_count: int | None = None
+    # Lower validation scores indicate better performance.
+    best_epoch: EpochTrainingResult | None = None
     best_model_state: dict[str, torch.Tensor] | None = None
-    best_validation_metrics: dict[str, float] | None = None
-    best_displacement_metrics: DisplacementMetrics | None = None
     epoch_history: list[EpochTrainingResult] = []
 
     for epoch in range(EPOCHS):
-        # Set training-specific layer behavior, such as dropout, for this epoch.
-        model.train()
-        training_loss = 0.0
-        for histories, targets in training_loader:
-            histories, targets = histories.to(device), targets.to(device)
-            # Clear prior gradients, compute the batch loss, then update weights.
-            optimizer.zero_grad()
-            loss = loss_function(model(histories), targets)
-            loss.backward()
-            optimizer.step()
-            # Weight each batch mean by its size for a true epoch-wide mean.
-            training_loss += loss.item() * len(histories)
-
-        # Evaluate both scaled prediction loss and displacement in meters.
-        validation_loss = evaluate_validation_loss(
+        epoch_result = train_one_epoch(
             model,
+            training_loader,
             validation_loader,
+            validation_set,
             loss_function,
+            optimizer,
             device,
-            len(validation_set),
-        )
-        forecast_count, forecast_metrics = validate_displacement(
-            model,
-            validation_data,
-            feature_scaler,
             position_scaler,
-            device,
-            HISTORY_SECONDS,
-            FORECAST_SECONDS,
-            FEATURE_COLUMNS,
             POSITION_COLUMNS,
             BATCH_SIZE,
+            epoch + 1,
         )
-        training_mse = training_loss / len(training_set)
-        displacement_metrics = DisplacementMetrics.from_mapping(forecast_metrics)
-        epoch_history.append(
-            EpochTrainingResult(
-                epoch=epoch + 1,
-                training_mse=training_mse,
-                validation_mse_standardized=validation_loss,
-                validation_forecast_count=forecast_count,
-                displacement_metrics=displacement_metrics,
-            )
-        )
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS}: "
-            f"train MSE={training_mse:.4f}, "
-            f"direct {FORECAST_SECONDS}-second validation MSE={validation_loss:.4f}"
-        )
-        print(
-            f"  Mean over {FORECAST_SECONDS} seconds ({forecast_count} forecasts): "
-            f"horizontal RMSE={forecast_metrics['mean_horizontal_rmse_m']:.1f} m, "
-            f"vertical RMSE={forecast_metrics['mean_vertical_rmse_m']:.1f} m "
-            f"(east={forecast_metrics['mean_east_rmse_m']:.1f} m, "
-            f"north={forecast_metrics['mean_north_rmse_m']:.1f} m)"
-        )
-        print(
-            f"  At {FORECAST_SECONDS} seconds: "
-            f"horizontal RMSE={forecast_metrics['final_horizontal_rmse_m']:.1f} m, "
-            f"vertical RMSE={forecast_metrics['final_vertical_rmse_m']:.1f} m "
-            f"(east={forecast_metrics['final_east_rmse_m']:.1f} m, "
-            f"north={forecast_metrics['final_north_rmse_m']:.1f} m)"
-        )
-        print(
-            "  Selection score (mean of average horizontal and vertical "
-            f"RMSE): {forecast_metrics['selection_score_m']:.1f} m"
-        )
+        epoch_history.append(epoch_result)
+        print_epoch_result(epoch_result, EPOCHS, FORECAST_SECONDS)
 
         # Keep the epoch with the lowest average horizontal/vertical RMSE score.
-        if forecast_metrics["selection_score_m"] < best_validation_score:
-            best_validation_score = forecast_metrics["selection_score_m"]
-            best_epoch = epoch + 1
-            best_training_mse = training_mse
-            best_validation_loss = validation_loss
-            best_forecast_count = forecast_count
-            best_displacement_metrics = displacement_metrics
+        if (
+            best_epoch is None
+            or epoch_result.displacement_metrics.selection_score_m
+            < best_epoch.displacement_metrics.selection_score_m
+        ):
+            best_epoch = epoch_result
             # Clone to CPU so later optimizer updates cannot alter this snapshot.
             best_model_state = {
                 name: value.detach().cpu().clone()
                 for name, value in model.state_dict().items()
             }
-            best_validation_metrics = forecast_metrics.copy()
 
-    if (
-        best_model_state is None
-        or best_validation_metrics is None
-        or best_training_mse is None
-        or best_validation_loss is None
-        or best_forecast_count is None
-        or best_displacement_metrics is None
-    ):
+    if best_model_state is None or best_epoch is None:
         raise RuntimeError("Training did not produce a best model checkpoint.")
 
-    # Restore the selected epoch before writing its weights.
-    model.load_state_dict(best_model_state)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": best_model_state,
-            # Store both scalers so inference normalizes inputs and converts
-            # predicted positions back to their original units.
-            "feature_mean": feature_scaler.mean_.tolist(),
-            "feature_scale": feature_scaler.scale_.tolist(),
-            "position_mean": position_scaler.mean_.tolist(),
-            "position_scale": position_scaler.scale_.tolist(),
-            "feature_columns": FEATURE_COLUMNS,
-            "position_columns": POSITION_COLUMNS,
-            "best_epoch": best_epoch,
-            "best_validation_score_m": best_validation_score,
-            "best_validation_metrics": best_validation_metrics,
-            "forecast_mode": FORECAST_MODE,
-        },
+    save_best_model(
+        model,
         output_path,
-    )
-    print(
-        f"Saved best model to {output_path} "
-        f"(epoch {best_epoch}, score={best_validation_score:.1f} m)"
+        best_model_state,
+        feature_scaler,
+        position_scaler,
+        FEATURE_COLUMNS,
+        POSITION_COLUMNS,
+        best_epoch,
+        FORECAST_MODE,
     )
 
     heldout_examples: int | None = None
     heldout_forecast_count: int | None = None
     heldout_validation_loss: float | None = None
-    heldout_displacement_metrics: DisplacementMetrics | None = None
+    heldout_displacement_metrics: ForecastMetrics | None = None
     if heldout_loader is not None:
         if heldout_data is None or heldout_set is None:
             raise RuntimeError("Held-out loader is missing its source data or dataset.")
@@ -329,22 +424,17 @@ def train(
             device,
             heldout_examples,
         )
-        heldout_forecast_count, heldout_metrics = validate_displacement(
+        heldout_forecast_count, heldout_displacement_metrics = validate_displacement(
             model,
-            heldout_data,
-            feature_scaler,
+            heldout_set,
             position_scaler,
             device,
-            HISTORY_SECONDS,
-            FORECAST_SECONDS,
-            FEATURE_COLUMNS,
             POSITION_COLUMNS,
             BATCH_SIZE,
         )
-        heldout_displacement_metrics = DisplacementMetrics.from_mapping(heldout_metrics)
         print(
             f"Held-out test: standardized MSE={heldout_validation_loss:.4f}, "
-            f"selection score={heldout_metrics['selection_score_m']:.1f} m "
+            f"selection score={heldout_displacement_metrics.selection_score_m:.1f} m "
             f"({heldout_forecast_count} forecasts)"
         )
 
@@ -389,11 +479,6 @@ def train(
         training_examples=len(training_set),
         validation_examples=len(validation_set),
         best_epoch=best_epoch,
-        best_training_mse=best_training_mse,
-        best_validation_mse_standardized=best_validation_loss,
-        best_validation_forecast_count=best_forecast_count,
-        best_selection_score_m=best_validation_score,
-        best_displacement_metrics=best_displacement_metrics,
         epoch_history=tuple(epoch_history),
     )
     results_path = save_training_results(results)

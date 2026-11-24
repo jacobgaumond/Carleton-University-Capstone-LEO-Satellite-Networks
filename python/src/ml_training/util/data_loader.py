@@ -6,6 +6,7 @@ history or forecast never crosses a flight boundary or a timestamp gap.
 """
 
 from bisect import bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,8 +27,8 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     contains the following ``forecast_seconds`` rows of output positions.
 
     Attributes:
-        segments: Scaled continuous feature and position runs, kept separate
-            by flight path and timestamp gaps.
+        segments: Dictionaries containing scaled feature and position runs
+            plus raw position targets, kept separate by path and time gaps.
         cumulative_window_counts: Cumulative number of valid windows through
             each segment, used to map a dataset index to its segment.
         history_seconds: Number of rows returned in each input window.
@@ -61,7 +62,7 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         """
         # Each segment is a continuous run; a flight path or timestamp gap
         # always starts a separate run.
-        self.segments: list[tuple[np.ndarray, np.ndarray]] = []
+        self.segments: list[dict[str, np.ndarray]] = []
         # Cumulative counts allow global dataset indices to be mapped to runs.
         self.cumulative_window_counts: list[int] = []
         window_count = 0
@@ -89,7 +90,15 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 scaled_positions = position_scaler.transform(position_run).astype(
                     np.float32
                 )
-                self.segments.append((scaled_features, scaled_positions))
+                # Keep raw targets as well: distance metrics need geographic
+                # coordinates, while model loss uses standardized positions.
+                self.segments.append(
+                    {
+                        "scaled_features": scaled_features,
+                        "scaled_positions": scaled_positions,
+                        "raw_positions": position_run,
+                    }
+                )
                 window_count += count
                 self.cumulative_window_counts.append(window_count)
 
@@ -119,16 +128,78 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         """
         # Find which continuous run contains this sliding-window index.
         segment_index = bisect_right(self.cumulative_window_counts, index)
+        # Convert the global index to an offset local to that run.
         previous_count = (
             self.cumulative_window_counts[segment_index - 1] if segment_index > 0 else 0
         )
         start = index - previous_count
-        scaled_features, scaled_positions = self.segments[segment_index]
+        segment = self.segments[segment_index]
+        scaled_features = segment["scaled_features"]
+        scaled_positions = segment["scaled_positions"]
         # Return observed features and the following ground-truth positions.
         history = scaled_features[start : start + self.history_seconds]
         future_start = start + self.history_seconds
         future = scaled_positions[future_start : future_start + self.forecast_seconds]
         return torch.from_numpy(history), torch.from_numpy(future)
+
+    def iter_validation_batches(
+        self,
+        batch_size: int,
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Yield model-ready histories and raw targets for non-overlapping forecasts.
+
+        Training windows overlap at every possible start. Validation metric
+        windows instead start one forecast horizon apart so their targets do
+        not overlap.
+
+        Args:
+            batch_size: Maximum number of forecast windows per yielded batch.
+
+        Yields:
+            Standardized feature histories shaped
+            ``[batch, history, input_features]`` and matching unscaled position
+            targets shaped ``[batch, forecast, output_positions]``.
+
+        Raises:
+            ValueError: If ``batch_size`` is not positive.
+        """
+        if batch_size <= 0:
+            raise ValueError("Validation batch size must be positive.")
+
+        # Each forecast sample needs a complete input history and target.
+        required_rows = self.history_seconds + self.forecast_seconds
+        for segment in self.segments:
+            scaled_features = segment["scaled_features"]
+            raw_positions = segment["raw_positions"]
+            # This is inclusive: its history and forecast end exactly at the
+            # run's final observation.
+            last_start = len(raw_positions) - required_rows
+            # Advancing by one forecast horizon keeps target intervals disjoint.
+            starts = range(0, last_start + 1, self.forecast_seconds)
+            # Split the available forecast starts into memory-bounded batches.
+            for batch_start in range(0, len(starts), batch_size):
+                batch_starts = starts[batch_start : batch_start + batch_size]
+                # Inputs are already standardized for the model.
+                histories = np.stack(
+                    [
+                        scaled_features[start : start + self.history_seconds]
+                        for start in batch_starts
+                    ]
+                )
+                # Keep actual targets unscaled so displacement metrics use
+                # latitude/longitude degrees and altitude meters.
+                actual_positions = np.stack(
+                    [
+                        raw_positions[
+                            start
+                            + self.history_seconds : start
+                            + self.history_seconds
+                            + self.forecast_seconds
+                        ]
+                        for start in batch_starts
+                    ]
+                )
+                yield histories, actual_positions
 
 
 @dataclass(frozen=True)
@@ -271,9 +342,9 @@ def create_data_loaders(
             no continuous run long enough to make a complete window.
     """
     data = load_data(path, feature_columns, position_columns)
-    training_data, validation_data = split_paths(
-        data, validation_fraction, random_seed
-    )
+    training_data, validation_data = split_paths(data, validation_fraction, random_seed)
+    # Fit only on training paths so validation and test data cannot leak into
+    # the normalization statistics.
     feature_scaler = StandardScaler().fit(
         training_data[feature_columns].to_numpy(dtype=np.float32)
     )
@@ -303,6 +374,7 @@ def create_data_loaders(
     heldout_loader = None
     if heldout_path is not None:
         heldout_data = load_data(heldout_path, feature_columns, position_columns)
+        # Reuse training scalers; never fit them on held-out test values.
         heldout_set = PositionWindows(
             heldout_data,
             feature_scaler,

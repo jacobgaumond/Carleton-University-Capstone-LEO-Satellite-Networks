@@ -5,14 +5,32 @@ computed in meters after predictions are converted back to the original
 latitude, longitude, and altitude units.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
-import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from .data_loader import PositionWindows
+
 EARTH_RADIUS_METERS = 6_371_000
+
+
+@dataclass(frozen=True)
+class ForecastMetrics:
+    """Mean-horizon and final-step displacement RMSE values in meters."""
+
+    mean_horizontal_rmse_m: float
+    mean_vertical_rmse_m: float
+    mean_east_rmse_m: float
+    mean_north_rmse_m: float
+    final_horizontal_rmse_m: float
+    final_vertical_rmse_m: float
+    final_east_rmse_m: float
+    final_north_rmse_m: float
+    selection_score_m: float
 
 
 def evaluate_validation_loss(
@@ -114,47 +132,40 @@ def calculate_displacement_errors(
 
 def validate_displacement(
     model: nn.Module,
-    data: pd.DataFrame,
-    feature_scaler: StandardScaler,
+    validation_set: PositionWindows,
     position_scaler: StandardScaler,
     device: torch.device,
-    history_seconds: int,
-    forecast_seconds: int,
-    feature_columns: list[str],
     position_columns: list[str],
     batch_size: int,
-) -> tuple[int, dict[str, float]]:
+) -> tuple[int, ForecastMetrics]:
     """Measure average and final forecast displacement errors in meters.
 
     Only complete, continuous runs are evaluated. Forecast starts are spaced
     ``forecast_seconds`` apart, producing non-overlapping target windows. The
-    supplied position columns must be ordered as latitude, longitude, and
-    altitude because those coordinates are converted separately.
+    dataset yields non-overlapping forecast windows. Position columns must be
+    ordered as latitude, longitude, and altitude because those coordinates are
+    converted separately.
 
     Args:
         model: Trained model that predicts standardized positions.
-        data: Validation observations with timestamps and flight path IDs.
-        feature_scaler: Scaler used to transform model input features.
+        validation_set: Window dataset providing standardized histories and
+            raw-coordinate targets for validation.
         position_scaler: Scaler used to transform predicted positions.
         device: Device on which to execute model inference.
-        history_seconds: Number of history positions required per forecast.
-        forecast_seconds: Number of future positions predicted at each start.
-        feature_columns: Ordered input feature columns.
         position_columns: Output position columns in latitude/longitude/
             altitude order.
         batch_size: Maximum number of forecast windows evaluated together.
 
     Returns:
-        A pair containing the number of forecasts and a metrics dictionary.
-        The dictionary includes mean and final-step east, north, horizontal,
-        and vertical RMSE values, plus ``selection_score_m`` (the mean of mean
+        A pair containing the number of forecasts and their typed metrics.
+        The metrics include mean and final-step east, north, horizontal, and
+        vertical RMSE values, plus ``selection_score_m`` (the mean of mean
         horizontal and vertical RMSE).
 
     Raises:
         ValueError: If no validation run is long enough for the requested
             history and forecast durations.
     """
-    required_rows = history_seconds + forecast_seconds
     forecast_count = 0
     east_squared_error = 0.0
     north_squared_error = 0.0
@@ -169,106 +180,47 @@ def validate_displacement(
     model.eval()  # Set the model to evaluation mode
     with torch.no_grad():  # Disable gradient computation for efficiency since we are only evaluating the model.
 
-        # Iterate over each unique flight path in the validation data
-        for _, path in data.groupby("flight_path_id", sort=False):
-            elapsed_seconds = path["time"].diff().dt.total_seconds().to_numpy()
-            features = path[feature_columns].to_numpy(dtype=np.float32)
-            positions = path[position_columns].to_numpy(dtype=np.float32)
-            # Start a new run at every interval that is not exactly one second.
-            breaks = np.flatnonzero(elapsed_seconds[1:] != 1.0) + 1
+        for (
+            scaled_histories,
+            actual_positions,
+        ) in validation_set.iter_validation_batches(batch_size):
+            batch_count = len(scaled_histories)
+            history = torch.tensor(scaled_histories, dtype=torch.float32, device=device)
+            # Run the model to get standardized predictions. Moving them to CPU
+            # allows conversion to NumPy for inverse scaling.
+            # Inverse scaling turns the standardized predictions back to the original scale.
+            scaled_predictions_array = model(history).cpu().numpy()
+            predicted_positions = position_scaler.inverse_transform(
+                scaled_predictions_array.reshape(-1, len(position_columns))
+            ).reshape(
+                batch_count,
+                validation_set.forecast_seconds,
+                len(position_columns),
+            )
 
-            for feature_run, position_run in zip(
-                np.split(features, breaks),
-                np.split(positions, breaks),
-            ):
-                last_start = len(feature_run) - required_rows
-                if last_start < 0:
-                    continue
-
-                # Step by the forecast horizon to avoid overlapping targets.
-                starts = np.arange(0, last_start + 1, forecast_seconds, dtype=np.int64)
-
-                # Process starts in batches to limit memory use.
-                for batch_start in range(0, len(starts), batch_size):
-                    batch_starts = starts[batch_start : batch_start + batch_size]
-                    # Stack each history and its matching actual forecast.
-                    histories = np.stack(
-                        [
-                            feature_run[start : start + history_seconds]
-                            for start in batch_starts
-                        ]
-                    )
-                    actual_positions = np.stack(
-                        [
-                            position_run[
-                                start
-                                + history_seconds : start
-                                + history_seconds
-                                + forecast_seconds
-                            ]
-                            for start in batch_starts
-                        ]
-                    )
-
-                    # StandardScaler accepts 2D rows, so flatten and restore
-                    # the batch and time dimensions around the feature axis.
-                    scaled_histories = feature_scaler.transform(
-                        histories.reshape(-1, len(feature_columns))
-                    ).reshape(
-                        len(batch_starts),
-                        history_seconds,
-                        len(feature_columns),
-                    )
-                    # Restore [batch, history, features] for the LSTM.
-                    history = torch.tensor(
-                        scaled_histories, dtype=torch.float32, device=device
-                    )
-                    # Run the model to get standardized predictions. Moving
-                    # them to CPU allows conversion to NumPy for scaler use.
-                    scaled_predictions_array = model(history).cpu().numpy()
-                    # Flatten [batch, forecast, features] for StandardScaler,
-                    # then restore the forecast batch shape after conversion.
-                    predicted_positions = position_scaler.inverse_transform(
-                        scaled_predictions_array.reshape(-1, len(position_columns))
-                    ).reshape(
-                        len(batch_starts),
-                        forecast_seconds,
-                        len(position_columns),
-                    )
-
-                    # Compare predictions and actual positions in meters.
-                    east_error, north_error, vertical_error = (
-                        calculate_displacement_errors(
-                            predicted_positions, actual_positions
-                        )
-                    )
-                    # Combine east and north squared errors for horizontal RMSE.
-                    horizontal_error_squared = np.square(east_error) + np.square(
-                        north_error
-                    )
-                    # Accumulate squared errors to calculate horizon-wide RMSE.
-                    east_squared_error += np.square(east_error).sum()
-                    north_squared_error += np.square(north_error).sum()
-                    vertical_squared_error += np.square(vertical_error).sum()
-                    horizontal_squared_error += horizontal_error_squared.sum()
-                    # Track final-step errors separately for the endpoint RMSE.
-                    final_east_squared_error += np.square(east_error[:, -1]).sum()
-                    final_north_squared_error += np.square(north_error[:, -1]).sum()
-                    final_vertical_squared_error += np.square(
-                        vertical_error[:, -1]
-                    ).sum()
-                    final_horizontal_squared_error += horizontal_error_squared[
-                        :, -1
-                    ].sum()
-                    # Count forecasts separately from forecast positions: mean
-                    # metrics cover all horizon steps, final metrics one each.
-                    forecast_count += len(batch_starts)
-                    forecast_position_count += east_error.size
+            # Compare predictions and actual positions in meters.
+            east_error, north_error, vertical_error = calculate_displacement_errors(
+                predicted_positions, actual_positions
+            )
+            # Combine east and north squared errors for horizontal RMSE.
+            horizontal_error_squared = np.square(east_error) + np.square(north_error)
+            # Accumulate squared errors to calculate horizon-wide RMSE.
+            east_squared_error += np.square(east_error).sum()
+            north_squared_error += np.square(north_error).sum()
+            vertical_squared_error += np.square(vertical_error).sum()
+            horizontal_squared_error += horizontal_error_squared.sum()
+            # Track final-step errors separately for the endpoint RMSE.
+            final_east_squared_error += np.square(east_error[:, -1]).sum()
+            final_north_squared_error += np.square(north_error[:, -1]).sum()
+            final_vertical_squared_error += np.square(vertical_error[:, -1]).sum()
+            final_horizontal_squared_error += horizontal_error_squared[:, -1].sum()
+            # Mean metrics cover every forecast position; final metrics one each.
+            forecast_count += batch_count
+            forecast_position_count += east_error.size
 
     if forecast_count == 0:
         raise ValueError(
-            f"No validation flight has a continuous {forecast_seconds}-second forecast "
-            f"after the {history_seconds}-second history."
+            "No validation examples are available for displacement metrics."
         )
 
     mean_horizontal_rmse = float(
@@ -277,24 +229,18 @@ def validate_displacement(
     mean_vertical_rmse = float(
         np.sqrt(vertical_squared_error / forecast_position_count)
     )
-    return forecast_count, {
-        "mean_horizontal_rmse_m": mean_horizontal_rmse,
-        "mean_vertical_rmse_m": mean_vertical_rmse,
-        "mean_east_rmse_m": float(
-            np.sqrt(east_squared_error / forecast_position_count)
-        ),
-        "mean_north_rmse_m": float(
-            np.sqrt(north_squared_error / forecast_position_count)
-        ),
-        "final_horizontal_rmse_m": float(
+    return forecast_count, ForecastMetrics(
+        mean_horizontal_rmse_m=mean_horizontal_rmse,
+        mean_vertical_rmse_m=mean_vertical_rmse,
+        mean_east_rmse_m=float(np.sqrt(east_squared_error / forecast_position_count)),
+        mean_north_rmse_m=float(np.sqrt(north_squared_error / forecast_position_count)),
+        final_horizontal_rmse_m=float(
             np.sqrt(final_horizontal_squared_error / forecast_count)
         ),
-        "final_vertical_rmse_m": float(
+        final_vertical_rmse_m=float(
             np.sqrt(final_vertical_squared_error / forecast_count)
         ),
-        "final_east_rmse_m": float(np.sqrt(final_east_squared_error / forecast_count)),
-        "final_north_rmse_m": float(
-            np.sqrt(final_north_squared_error / forecast_count)
-        ),
-        "selection_score_m": (mean_horizontal_rmse + mean_vertical_rmse) / 2,
-    }
+        final_east_rmse_m=float(np.sqrt(final_east_squared_error / forecast_count)),
+        final_north_rmse_m=float(np.sqrt(final_north_squared_error / forecast_count)),
+        selection_score_m=(mean_horizontal_rmse + mean_vertical_rmse) / 2,
+    )
