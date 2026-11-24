@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from bisect import bisect_right
 
-WINDOW_SIZE = 10
+WINDOW_SIZE = 10 # We should start with window_size = 10, and experiment with 15 and 20 (maybe 30, if our machines can keep up).
 TARGET_DIMS = 3
 
 class AdsBDataset(Dataset):
@@ -18,7 +18,6 @@ class AdsBDataset(Dataset):
             list[torch.Tensor] holding the flight paths of the Dataset.
         self._window_size
             int size of the sliding windows (i.e., fixed slice of consecutive data points) that are used as inputs during training.
-            Note: We should start with window_size = 10, and experiment with 15 and 20 (maybe 30, if our machines can keep up).
         self._target_dims
             int number of Tensor dimensions (i.e., DataFrame/CSV feature columns) that are relevant for our target/desired output (e.g., lat,
             lon, and geoaltitude). These dimensions/columns should be stored at the front of the Tensor (i.e., the first 3 dimensions).
