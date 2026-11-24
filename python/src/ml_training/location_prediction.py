@@ -5,6 +5,9 @@ from torch.utils.data import Dataset, DataLoader
 
 from bisect import bisect_right
 
+WINDOW_SIZE = 10
+TARGET_DIMS = 3
+
 class AdsBDataset(Dataset):
     """
     Considerations:
@@ -23,7 +26,7 @@ class AdsBDataset(Dataset):
             list[int] where each entry with index i + 1 contains the total number of sliding windows in all paths up to self._flight_paths[i]
             (inclusive).
     """
-    def __init__(self, flight_paths: list[torch.Tensor], window_size: int = 10):
+    def __init__(self, flight_paths: list[torch.Tensor], window_size: int = WINDOW_SIZE):
         """
         Requirements:
             - The first 3 dimensions of flight_paths' Tensors (i.e., the first 3 columns of the DataFrame/CSV) must contain the flight path's
@@ -36,7 +39,7 @@ class AdsBDataset(Dataset):
                                                                                                 # Cloning to avoid mutation via the list/Tensor reference.
 
         self._window_size = window_size
-        self._target_dims = 3
+        self._target_dims = TARGET_DIMS
 
         # _cumulative_sliding_window_count[i + 1] = total valid windows across groups 0..i
         # (i.e., _cumulative_sliding_window_count is a list, where each entry with index i + 1 contains the total number of sliding windows in all paths up to _flight_paths[i])
