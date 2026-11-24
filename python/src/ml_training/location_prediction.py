@@ -52,7 +52,7 @@ class AdsBDataset(Dataset):
         if idx < 0:
             idx += len(self)
         if idx < 0 or idx >= len(self):
-            raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
+            raise IndexError(f"AdsBDataset.__getitem__: Index {idx} out of range for dataset of length {len(self)}")
 
         # Find path_idx such that _cumulative_sliding_window_count[path_idx] <= idx < _cumulative_sliding_window_count[path_idx + 1]
         # (i.e., find the path_idx identifying the path that contains the "idxth" sliding window)
