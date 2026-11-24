@@ -5,14 +5,14 @@ from torch.utils.data import Dataset, DataLoader
 
 from bisect import bisect_right
 
-class AdsBDataSet(Dataset):
+class AdsBDataset(Dataset):
     """
     Considerations:
-        - One should split their flight paths into training/validation/test lists *before* feeding them into an AdsBDataSet (i.e., use three
-          separate AdsBDataSets).
+        - One should split their flight paths into training/validation/test lists *before* feeding them into an AdsBDataset (i.e., use three
+          separate AdsBDatasets).
     Attributes:
         self._flight_paths
-            list[torch.Tensor] holding the flight paths of the DataSet.
+            list[torch.Tensor] holding the flight paths of the Dataset.
         self._window_size
             int size of the sliding windows (i.e., fixed slice of consecutive data points) that are used as inputs during training.
             Note: We should start with window_size = 10, and experiment with 15 and 20 (maybe 30, if our machines can keep up).
@@ -30,7 +30,7 @@ class AdsBDataSet(Dataset):
               lat, lon, and geoaltitude data (relates to how self._target_dims is used)
         """
         if window_size < 1:
-            raise ValueError("AdsBDataSet.__init__: window_size must be at least 1")
+            raise ValueError("AdsBDataset.__init__: window_size must be at least 1")
 
         self._flight_paths = [path.clone() for path in flight_paths if len(path) > window_size] # Only use paths with at least 1 window slice.
                                                                                                 # Cloning to avoid mutation via the list/Tensor reference.
