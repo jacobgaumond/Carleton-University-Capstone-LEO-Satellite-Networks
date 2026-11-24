@@ -8,6 +8,9 @@ from bisect import bisect_right
 WINDOW_SIZE = 10 # We should start with window_size = 10, and experiment with 15 and 20 (maybe 30, if our machines can keep up).
 TARGET_DIMS = 3
 
+BATCH_SIZE  = 64 # We should experiment, starting with 64 or 128. Small batch sizes (like 16 or 32) produce noiser gradient estimates per step (can help regularization (i.e., avoiding overfitting)), while large batch sizes (128 or 256+) smooth out gradients at the cost of fewer weight updates per epoch (i.e., for the same size dataset) and memory/compute resources.
+NUM_WORKERS = 0 # When NUM_WORKERS == 0, data loading is done synchronously in the main thread. When > 0, extra threads are spawned to do this; since we're using Tensors, the data is already in-memory, and using more threads will have little or no benefit, and can even harm due to the IPC overhead.
+
 class AdsBDataset(Dataset):
     """
     Considerations:
@@ -72,3 +75,49 @@ class AdsBDataset(Dataset):
         ## We are indexing the data point after the window slice, and returning the first three values in that data point (i.e., lat, lon, geoaltitude).
         y = path[data_point_idx + self._window_size, : self._target_dims]   # Tensor shape: (target_dims,)
         return x, y
+
+def createTrainValTestDataLoaders(flight_paths: list[torch.Tensor],
+                                  train_val_test_split: tuple[int, int, int] = (70, 15, 15),
+                                  batch_size: int = BATCH_SIZE,
+                                  num_workers: int = NUM_WORKERS,
+                                  ds_window_size: int = None, # Avoid changing; None defaults to AdsBDataset's default
+                                  ) -> dict[str, AdsBDataset]:
+    """
+    Takes:
+        - A list of Tensors containing ADS-B flight path data.
+        - An optional specification for how the data should be split into training, validation, and testing data, stored in a tuple containing
+          the percentages of each (in that order). The percentages must add to 100.
+        - An optional window_size that overwrites the AdsBDataset default.
+
+    Returns three DataLoaders in a dictionary, for training, validation, and testing. Each DataLoader is indexed with "train", "val", and
+    "test", respectively.
+    """
+    SPLIT_TRAIN_INDEX = 0
+    SPLIT_VAL_INDEX   = 1
+    SPLIT_TEST_INDEX  = 2
+
+    if sum(train_val_test_split) != 100:
+        raise ValueError("createTrainValTestDataLoaders: train_val_test_split values must add to 100")
+    num_train_paths = len(flight_paths) * train_val_test_split[SPLIT_TRAIN_INDEX] // 100
+    num_val_paths   = len(flight_paths) * train_val_test_split[SPLIT_VAL_INDEX]   // 100
+
+    datasets = {"train": None, "val": None, "test": None}
+    if ds_window_size is None:
+        datasets["train"]   = AdsBDataset(flight_paths[: num_train_paths])
+        datasets["val"]     = AdsBDataset(flight_paths[num_train_paths : num_train_paths + num_val_paths])
+        datasets["test"]    = AdsBDataset(flight_paths[num_train_paths + num_val_paths :])
+    else:
+        datasets["train"]   = AdsBDataset(flight_paths[: num_train_paths]                                   , ds_window_size)
+        datasets["val"]     = AdsBDataset(flight_paths[num_train_paths : num_train_paths + num_val_paths]   , ds_window_size)
+        datasets["test"]    = AdsBDataset(flight_paths[num_train_paths + num_val_paths :]                   , ds_window_size)
+
+    for key, ds in datasets.items:
+        if len(ds) < 1:
+            raise ValueError(f"createTrainValTestDataLoaders: The {key} dataset has no sliding windows; increase the number of valid paths in flight_paths or adjust the percentages in train_val_test_split")
+
+    dataLoaders = {
+        "train":    DataLoader(datasets["train"],   batch_size=batch_size, num_workers=num_workers, shuffle=True),
+        "val":      DataLoader(datasets["val"],     batch_size=batch_size, num_workers=num_workers, shuffle=False),
+        "test":     DataLoader(datasets["test"],    batch_size=batch_size, num_workers=num_workers, shuffle=False),
+                   }
+    return dataLoaders
