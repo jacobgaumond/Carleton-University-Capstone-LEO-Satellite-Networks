@@ -8,7 +8,7 @@ DEFAULT_INPUT_FILENAME      = "adsb_trajectory_data_cleaned.csv"
 
 # Note: If modifying NUMPY_FLOAT_DATA_TYPE, you should also modifying the Tensor `dtype` used the function `tensor_list_from_ads_b_df`
 NUMPY_FLOAT_DATA_TYPE = "float32" # The lat, lon, geoaltitude, velocity, and heading are typecasted from float64, as its unsupported for MPS Tensors; we can experiment with non-MPS and float64 later, if needed.
-FEATURE_COLS = ["time_diff", "lat", "lon", "geoaltitude", "velocity", "heading"]
+FEATURE_COLS = ["lat", "lon", "geoaltitude", "velocity", "heading", "time_diff"]
 
 # Setup hardware device
 
