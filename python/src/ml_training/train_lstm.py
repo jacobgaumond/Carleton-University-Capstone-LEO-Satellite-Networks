@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import platform
-from time import perf_counter
+from time import perf_counter, time
 
 from sklearn.preprocessing import StandardScaler
 import torch
@@ -164,6 +164,7 @@ def train_one_epoch(
     example_count = 0
     total_batches = len(training_loader)
     progress_width = 30
+    start = time()
 
     for batch_index, (histories, targets) in enumerate(training_loader, start=1):
         histories, targets = histories.to(device), targets.to(device)
@@ -178,15 +179,24 @@ def train_one_epoch(
         total_loss += loss.item() * batch_size
         example_count += batch_size
 
-        completed_width = int(progress_width * batch_index / total_batches)
-        progress_bar = "=" * completed_width + " " * (progress_width - completed_width)
-        current_mse = total_loss / example_count
-        print(
-            f"\rTraining [{progress_bar}] {batch_index}/{total_batches} "
-            f"MSE: {current_mse:.4f}",
-            end="",
-            flush=True,
-        )
+        if batch_index % 1000 == 0:  # Print progress every 1000 batches
+            completed_width = int(progress_width * batch_index / total_batches)
+            progress_bar = "=" * completed_width + " " * (
+                progress_width - completed_width
+            )
+            current_mse = total_loss / example_count
+            progress_per_s = batch_index / (time() - start)
+            eta_s = (
+                (total_batches - batch_index) / progress_per_s
+                if progress_per_s > 0
+                else 0
+            )
+            print(
+                f"\rTraining [{progress_bar}] {batch_index}/{total_batches} "
+                f"MSE: {current_mse:.4f}, ETA: {eta_s:.0f} s    ",  # whitespace so the printover doesnt leave trailing characters
+                end="",
+                flush=True,
+            )
 
     if example_count == 0:
         raise ValueError("Training loader produced no examples for this epoch.")
