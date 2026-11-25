@@ -91,7 +91,8 @@ def forecast(
     Returns:
         Unscaled future positions shaped
         ``[forecast_steps, len(position_columns)]``, where ``forecast_steps``
-        is the model's configured output horizon.
+        is the model's configured output count. Rows follow the model's
+        configured forecast interval; timestamps are not included.
 
     Raises:
         ValueError: If ``recent_features`` does not have the required shape.

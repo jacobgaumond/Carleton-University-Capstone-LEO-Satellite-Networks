@@ -23,8 +23,9 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     Flight paths should be split into training and validation sets before
     constructing datasets, so windows from one flight cannot occur in both.
-    Each input contains ``history_seconds`` rows of features, and each target
-    contains the following ``forecast_seconds`` rows of output positions.
+    Each input contains ``history_seconds`` rows of features. Targets sample
+    the future at ``forecast_interval_seconds`` intervals through the
+    ``forecast_horizon_seconds`` endpoint.
 
     Attributes:
         segments: Dictionaries containing scaled feature and position runs
@@ -32,7 +33,9 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         cumulative_window_counts: Cumulative number of valid windows through
             each segment, used to map a dataset index to its segment.
         history_seconds: Number of rows returned in each input window.
-        forecast_seconds: Number of future observations returned in each target.
+        forecast_horizon_seconds: Total future duration represented by targets.
+        forecast_interval_seconds: Seconds between output target positions.
+        forecast_steps: Number of target positions in each forecast.
     """
 
     def __init__(
@@ -43,7 +46,8 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         feature_columns: list[str],
         position_columns: list[str],
         history_seconds: int,
-        forecast_seconds: int,
+        forecast_horizon_seconds: int,
+        forecast_interval_seconds: int,
     ) -> None:
         """Create windows from the supplied path data.
 
@@ -55,11 +59,24 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             feature_columns: Ordered columns supplied to the model as input.
             position_columns: Ordered columns predicted by the model.
             history_seconds: Number of one-second feature rows in each input.
-            forecast_seconds: Number of one-second output rows in each target.
+            forecast_horizon_seconds: Future duration covered by each target.
+            forecast_interval_seconds: Seconds between sampled target positions.
 
         Raises:
             ValueError: If no uninterrupted run can supply a full window.
         """
+        if forecast_horizon_seconds <= 0 or forecast_interval_seconds <= 0:
+            raise ValueError("Forecast horizon and interval must be positive.")
+        if forecast_horizon_seconds % forecast_interval_seconds != 0:
+            raise ValueError(
+                "Forecast horizon must be divisible by the forecast interval."
+            )
+
+        forecast_offsets = np.arange(
+            forecast_interval_seconds - 1,
+            forecast_horizon_seconds,
+            forecast_interval_seconds,
+        )
         # Each segment is a continuous run; a flight path or timestamp gap
         # always starts a separate run.
         self.segments: list[dict[str, np.ndarray]] = []
@@ -80,7 +97,12 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 np.split(positions, breaks),
             ):
                 # The +1 counts the window whose last target is the run's last row.
-                count = len(feature_run) - history_seconds - forecast_seconds + 1
+                count = (
+                    len(feature_run)
+                    - history_seconds
+                    - forecast_horizon_seconds
+                    + 1
+                )
                 if count <= 0:
                     continue
                 # Apply training-only scalers consistently to both data splits.
@@ -106,11 +128,14 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             raise ValueError(
                 "No uninterrupted one-second path is long enough for "
                 f"{history_seconds} seconds of history and "
-                f"{forecast_seconds} seconds of future positions."
+                f"{forecast_horizon_seconds} seconds of future positions."
             )
 
         self.history_seconds = history_seconds
-        self.forecast_seconds = forecast_seconds
+        self.forecast_horizon_seconds = forecast_horizon_seconds
+        self.forecast_interval_seconds = forecast_interval_seconds
+        self.forecast_steps = len(forecast_offsets)
+        self.forecast_offsets = forecast_offsets
 
     def __len__(self) -> int:
         """Return the number of valid history-to-forecast windows."""
@@ -124,7 +149,7 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
         Returns:
             A pair of tensors shaped ``[history_seconds, input_features]`` and
-            ``[forecast_seconds, output_positions]``.
+            ``[forecast_steps, output_positions]``.
         """
         # Find which continuous run contains this sliding-window index.
         segment_index = bisect_right(self.cumulative_window_counts, index)
@@ -139,7 +164,7 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         # Return observed features and the following ground-truth positions.
         history = scaled_features[start : start + self.history_seconds]
         future_start = start + self.history_seconds
-        future = scaled_positions[future_start : future_start + self.forecast_seconds]
+        future = scaled_positions[future_start + self.forecast_offsets]
         return torch.from_numpy(history), torch.from_numpy(future)
 
     def iter_validation_batches(
@@ -158,7 +183,7 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         Yields:
             Standardized feature histories shaped
             ``[batch, history, input_features]`` and matching unscaled position
-            targets shaped ``[batch, forecast, output_positions]``.
+            targets shaped ``[batch, forecast_steps, output_positions]``.
 
         Raises:
             ValueError: If ``batch_size`` is not positive.
@@ -167,15 +192,15 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             raise ValueError("Validation batch size must be positive.")
 
         # Each forecast sample needs a complete input history and target.
-        required_rows = self.history_seconds + self.forecast_seconds
+        required_rows = self.history_seconds + self.forecast_horizon_seconds
         for segment in self.segments:
             scaled_features = segment["scaled_features"]
             raw_positions = segment["raw_positions"]
             # This is inclusive: its history and forecast end exactly at the
             # run's final observation.
             last_start = len(raw_positions) - required_rows
-            # Advancing by one forecast horizon keeps target intervals disjoint.
-            starts = range(0, last_start + 1, self.forecast_seconds)
+            # Advancing by a forecast horizon keeps target intervals disjoint.
+            starts = range(0, last_start + 1, self.forecast_horizon_seconds)
             # Split the available forecast starts into memory-bounded batches.
             for batch_start in range(0, len(starts), batch_size):
                 batch_starts = starts[batch_start : batch_start + batch_size]
@@ -191,10 +216,7 @@ class PositionWindows(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 actual_positions = np.stack(
                     [
                         raw_positions[
-                            start
-                            + self.history_seconds : start
-                            + self.history_seconds
-                            + self.forecast_seconds
+                            start + self.history_seconds + self.forecast_offsets
                         ]
                         for start in batch_starts
                     ]
@@ -310,7 +332,8 @@ def create_data_loaders(
     feature_columns: list[str],
     position_columns: list[str],
     history_seconds: int,
-    forecast_seconds: int,
+    forecast_horizon_seconds: int,
+    forecast_interval_seconds: int,
     batch_size: int,
     validation_fraction: float,
     random_seed: int,
@@ -327,7 +350,8 @@ def create_data_loaders(
         feature_columns: Ordered columns supplied to the model as input.
         position_columns: Ordered columns predicted by the model.
         history_seconds: Number of observed seconds in each input window.
-        forecast_seconds: Number of future seconds in each target window.
+        forecast_horizon_seconds: Future duration covered by each target.
+        forecast_interval_seconds: Seconds between sampled target positions.
         batch_size: Number of windows per DataLoader batch.
         validation_fraction: Fraction of distinct flight paths held out.
         random_seed: Seed used for the path-level train/validation split.
@@ -358,7 +382,8 @@ def create_data_loaders(
         feature_columns,
         position_columns,
         history_seconds,
-        forecast_seconds,
+        forecast_horizon_seconds,
+        forecast_interval_seconds,
     )
     validation_set = PositionWindows(
         validation_data,
@@ -367,7 +392,8 @@ def create_data_loaders(
         feature_columns,
         position_columns,
         history_seconds,
-        forecast_seconds,
+        forecast_horizon_seconds,
+        forecast_interval_seconds,
     )
     heldout_data = None
     heldout_set = None
@@ -382,7 +408,8 @@ def create_data_loaders(
             feature_columns,
             position_columns,
             history_seconds,
-            forecast_seconds,
+            forecast_horizon_seconds,
+            forecast_interval_seconds,
         )
         heldout_loader = DataLoader(heldout_set, batch_size=batch_size)
 

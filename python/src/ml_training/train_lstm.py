@@ -66,14 +66,15 @@ DEFAULT_HELDOUT_INPUT = (
 FEATURE_COLUMNS = ["lat", "lon", "geoaltitude", "velocity", "heading"]
 POSITION_COLUMNS = ["lat", "lon", "geoaltitude"]
 HISTORY_SECONDS = 120  # Number of observed one-second positions per input.
-FORECAST_SECONDS = 300  # Number of future one-second positions predicted at once.
+FORECAST_HORIZON_SECONDS = 300  # How far into the future the model predicts.
+FORECAST_INTERVAL_SECONDS = 10  # Time between predicted positions.
 HIDDEN_SIZE = 32  # Number of features in the LSTM's hidden state.
 BATCH_SIZE = 32  # Number of examples per optimizer update.
 EPOCHS = 5  # Full passes over the training examples.
 LEARNING_RATE = 0.001  # Adam optimizer step size.
 VALIDATION_FRACTION = 0.2  # Fraction of whole flight paths held out for validation.
 RANDOM_SEED = 42  # Seed used for repeatable splitting and PyTorch randomness.
-FORECAST_MODE = "direct_300_seconds"  # Checkpoint marker for this output format.
+FORECAST_MODE = "direct_300_seconds_every_10_seconds"
 
 
 class TrajectoryLSTM(nn.Module):
@@ -85,7 +86,9 @@ class TrajectoryLSTM(nn.Module):
     Attributes:
         feature_columns: Ordered input feature names.
         position_columns: Ordered output position names.
-        forecast_seconds: Number of future positions predicted by the model.
+        forecast_horizon_seconds: Total time covered by the forecast.
+        forecast_interval_seconds: Seconds between predicted positions.
+        forecast_steps: Number of positions predicted in the horizon.
         lstm: Recurrent layer that encodes the input history.
         output: Linear layer that produces the flattened future trajectory.
     """
@@ -94,7 +97,8 @@ class TrajectoryLSTM(nn.Module):
         self,
         feature_columns: list[str],
         position_columns: list[str],
-        forecast_seconds: int,
+        forecast_horizon_seconds: int,
+        forecast_interval_seconds: int,
         hidden_size: int,
     ) -> None:
         """Initialize the model architecture.
@@ -102,20 +106,33 @@ class TrajectoryLSTM(nn.Module):
         Args:
             feature_columns: Ordered input features represented in each row.
             position_columns: Ordered output position columns to predict.
-            forecast_seconds: Number of positions to predict directly.
+            forecast_horizon_seconds: Total future duration represented.
+            forecast_interval_seconds: Seconds between predicted positions.
             hidden_size: Number of features in the LSTM's hidden state.
         """
         super().__init__()
+        if forecast_horizon_seconds <= 0 or forecast_interval_seconds <= 0:
+            raise ValueError("Forecast horizon and interval must be positive.")
+        if forecast_horizon_seconds % forecast_interval_seconds != 0:
+            raise ValueError(
+                "Forecast horizon must be divisible by the forecast interval."
+            )
+
         self.feature_columns = feature_columns
         self.position_columns = position_columns
-        self.forecast_seconds = forecast_seconds
+        self.forecast_horizon_seconds = forecast_horizon_seconds
+        self.forecast_interval_seconds = forecast_interval_seconds
+        self.forecast_steps = forecast_horizon_seconds // forecast_interval_seconds
         # batch_first keeps LSTM inputs and outputs shaped [batch, time, features].
         self.lstm = nn.LSTM(
             input_size=len(feature_columns),
             hidden_size=hidden_size,
             batch_first=True,
         )
-        self.output = nn.Linear(hidden_size, forecast_seconds * len(position_columns))
+        self.output = nn.Linear(
+            hidden_size,
+            self.forecast_steps * len(position_columns),
+        )
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """Predict a batch of future sequences from a batch of histories.
@@ -126,7 +143,9 @@ class TrajectoryLSTM(nn.Module):
 
         Returns:
             Standardized predictions shaped
-            ``[batch, forecast_seconds, len(position_columns)]``.
+            ``[batch, forecast_steps, len(position_columns)]``, with output
+            steps spaced ``forecast_interval_seconds`` apart through the
+            configured forecast horizon.
 
         Notes:
             Each batch item is processed as an independent history window.
@@ -140,7 +159,7 @@ class TrajectoryLSTM(nn.Module):
         # Restore the flattened linear output to [batch, forecast, features].
         return forecast.reshape(
             history.shape[0],
-            self.forecast_seconds,
+            self.forecast_steps,
             len(self.position_columns),
         )
 
@@ -232,18 +251,20 @@ def train_one_epoch(
 def print_epoch_result(
     result: EpochTrainingResult,
     total_epochs: int,
-    forecast_seconds: int,
+    forecast_horizon_seconds: int,
+    forecast_interval_seconds: int,
 ) -> None:
     """Print training loss and validation displacement metrics for one epoch."""
     metrics = result.displacement_metrics
     print(
         f"Epoch {result.epoch}/{total_epochs}: "
         f"train MSE={result.training_mse:.4f}, "
-        f"direct {forecast_seconds}-second validation "
+        f"direct {forecast_horizon_seconds}-second validation "
         f"MSE={result.validation_mse_standardized:.4f}"
     )
     print(
-        f"  Mean over {forecast_seconds} seconds "
+        f"  Mean over {forecast_horizon_seconds // forecast_interval_seconds} "
+        f"forecast points sampled every {forecast_interval_seconds} seconds "
         f"({result.validation_forecast_count} forecasts): "
         f"horizontal RMSE={metrics.mean_horizontal_rmse_m:.1f} m, "
         f"vertical RMSE={metrics.mean_vertical_rmse_m:.1f} m "
@@ -251,7 +272,7 @@ def print_epoch_result(
         f"north={metrics.mean_north_rmse_m:.1f} m)"
     )
     print(
-        f"  At {forecast_seconds} seconds: "
+        f"  At {forecast_horizon_seconds} seconds: "
         f"horizontal RMSE={metrics.final_horizontal_rmse_m:.1f} m, "
         f"vertical RMSE={metrics.final_vertical_rmse_m:.1f} m "
         f"(east={metrics.final_east_rmse_m:.1f} m, "
@@ -272,6 +293,8 @@ def save_best_model(
     feature_columns: list[str],
     position_columns: list[str],
     best_epoch: EpochTrainingResult,
+    forecast_horizon_seconds: int,
+    forecast_interval_seconds: int,
     forecast_mode: str,
 ) -> None:
     """Restore and save the best checkpoint with its scaling metadata."""
@@ -299,6 +322,9 @@ def save_best_model(
                 best_epoch.displacement_metrics.selection_score_m
             ),
             "best_validation_metrics": asdict(best_epoch.displacement_metrics),
+            "forecast_horizon_seconds": forecast_horizon_seconds,
+            "forecast_interval_seconds": forecast_interval_seconds,
+            "forecast_steps": (forecast_horizon_seconds // forecast_interval_seconds),
             "forecast_mode": forecast_mode,
         },
         output_path,
@@ -315,7 +341,7 @@ def train(
     output_path: Path,
     heldout_path: Path | None = DEFAULT_HELDOUT_INPUT,
 ) -> None:
-    """Train a direct 300-second model and save its best checkpoint."""
+    """Train a 300-second trajectory model with 10-second output intervals."""
     run_started_at = datetime.now(timezone.utc)
     run_started = perf_counter()
     # Seed weight initialization and training-window shuffling.
@@ -326,7 +352,8 @@ def train(
         FEATURE_COLUMNS,
         POSITION_COLUMNS,
         HISTORY_SECONDS,
-        FORECAST_SECONDS,
+        FORECAST_HORIZON_SECONDS,
+        FORECAST_INTERVAL_SECONDS,
         BATCH_SIZE,
         VALIDATION_FRACTION,
         RANDOM_SEED,
@@ -358,12 +385,13 @@ def train(
     model = TrajectoryLSTM(
         FEATURE_COLUMNS,
         POSITION_COLUMNS,
-        FORECAST_SECONDS,
+        FORECAST_HORIZON_SECONDS,
+        FORECAST_INTERVAL_SECONDS,
         HIDDEN_SIZE,
     ).to(device)
 
     # Use mean squared error for both training and validation.
-    loss_function = nn.MSELoss()
+    loss_function = nn.L1Loss()
 
     # Use the Adam optimizer to update all model parameters.
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -388,7 +416,12 @@ def train(
             epoch + 1,
         )
         epoch_history.append(epoch_result)
-        print_epoch_result(epoch_result, EPOCHS, FORECAST_SECONDS)
+        print_epoch_result(
+            epoch_result,
+            EPOCHS,
+            FORECAST_HORIZON_SECONDS,
+            FORECAST_INTERVAL_SECONDS,
+        )
 
         # Keep the epoch with the lowest average horizontal/vertical RMSE score.
         if (
@@ -415,6 +448,8 @@ def train(
         FEATURE_COLUMNS,
         POSITION_COLUMNS,
         best_epoch,
+        FORECAST_HORIZON_SECONDS,
+        FORECAST_INTERVAL_SECONDS,
         FORECAST_MODE,
     )
 
@@ -473,7 +508,8 @@ def train(
         epochs_requested=EPOCHS,
         epochs_completed=len(epoch_history),
         history_seconds=HISTORY_SECONDS,
-        forecast_seconds=FORECAST_SECONDS,
+        forecast_seconds=FORECAST_HORIZON_SECONDS,
+        forecast_interval_seconds=FORECAST_INTERVAL_SECONDS,
         feature_columns=tuple(FEATURE_COLUMNS),
         position_columns=tuple(POSITION_COLUMNS),
         hidden_size=HIDDEN_SIZE,

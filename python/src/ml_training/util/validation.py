@@ -141,10 +141,10 @@ def validate_displacement(
     """Measure average and final forecast displacement errors in meters.
 
     Only complete, continuous runs are evaluated. Forecast starts are spaced
-    ``forecast_seconds`` apart, producing non-overlapping target windows. The
-    dataset yields non-overlapping forecast windows. Position columns must be
-    ordered as latitude, longitude, and altitude because those coordinates are
-    converted separately.
+    by the dataset's horizon, producing non-overlapping target windows. Each
+    forecast contains samples at the configured interval through that horizon.
+    Position columns must be ordered as latitude, longitude, and altitude
+    because those coordinates are converted separately.
 
     Args:
         model: Trained model that predicts standardized positions.
@@ -194,7 +194,7 @@ def validate_displacement(
                 scaled_predictions_array.reshape(-1, len(position_columns))
             ).reshape(
                 batch_count,
-                validation_set.forecast_seconds,
+                validation_set.forecast_steps,
                 len(position_columns),
             )
 

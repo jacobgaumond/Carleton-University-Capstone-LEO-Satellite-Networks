@@ -62,6 +62,7 @@ class TrainingResults:
     epochs_completed: int
     history_seconds: int
     forecast_seconds: int
+    forecast_interval_seconds: int
     feature_columns: tuple[str, ...]
     position_columns: tuple[str, ...]
     hidden_size: int
