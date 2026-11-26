@@ -37,17 +37,17 @@ class AdsBDataset(Dataset):
         if window_size < 1:
             raise ValueError("AdsBDataset.__init__: window_size must be at least 1")
 
-        self._flight_paths = [path.clone() for path in flight_paths if len(path) > window_size] # Only use paths with at least 1 window slice.
-                                                                                                # Cloning to avoid mutation via the list/Tensor reference.
-
         self._window_size = window_size
         self._target_dims = TARGET_DIMS
+        self._flight_paths = [path.clone() for path in flight_paths if len(path) > self._window_size]   # Only use paths with at least 1 window slice.
+                                                                                                        # Cloning to avoid mutation via the list/Tensor reference.
+
 
         # _cumulative_sliding_window_count[i + 1] = total valid windows across groups 0..i
         # (i.e., _cumulative_sliding_window_count is a list, where each entry with index i + 1 contains the total number of sliding windows in all paths up to _flight_paths[i])
         self._cumulative_sliding_window_count = [0]
         for path in self._flight_paths:
-            num_windows = max(0, path.shape[0] - window_size) # path.shape[0] is equivalent to len(path); it returns num of rows
+            num_windows = max(0, path.shape[0] - self._window_size) # path.shape[0] is equivalent to len(path); it returns num of rows
             self._cumulative_sliding_window_count.append(self._cumulative_sliding_window_count[-1] + num_windows)
 
     def __len__(self) -> int:
