@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from bisect import bisect_right
 
 WINDOW_SIZE = 10 # We should start with window_size = 10, and experiment with 15 and 20 (maybe 30, if our machines can keep up).
+HORIZON     = 5
 TARGET_DIMS = 3
 
 BATCH_SIZE  = 64 # We should experiment, starting with 64 or 128. Small batch sizes (like 16 or 32) produce noiser gradient estimates per step (can help regularization (i.e., avoiding overfitting)), while large batch sizes (128 or 256+) smooth out gradients at the cost of fewer weight updates per epoch (i.e., for the same size dataset) and memory/compute resources.
@@ -21,6 +22,9 @@ class AdsBDataset(Dataset):
             list[torch.Tensor] holding the flight paths of the Dataset.
         self._window_size
             int size of the sliding windows (i.e., fixed slice of consecutive data points) that are used as inputs during training.
+        self._horizon
+            int size of the horizons (i.e., fixed slice of consecutive data points that come directly after a sliding window) that are used
+            as outputs during training.
         self._target_dims
             int number of Tensor dimensions (i.e., DataFrame/CSV feature columns) that are relevant for our target/desired output (e.g., lat,
             lon, and geoaltitude). These dimensions/columns should be stored at the front of the Tensor (i.e., the first 3 dimensions).
@@ -28,7 +32,7 @@ class AdsBDataset(Dataset):
             list[int] where each entry with index i + 1 contains the total number of sliding windows in all paths up to self._flight_paths[i]
             (inclusive).
     """
-    def __init__(self, flight_paths: list[torch.Tensor], window_size: int = WINDOW_SIZE):
+    def __init__(self, flight_paths: list[torch.Tensor], window_size: int = WINDOW_SIZE, horizon: int = HORIZON):
         """
         Requirements:
             - The first 3 dimensions of flight_paths' Tensors (i.e., the first 3 columns of the DataFrame/CSV) must contain the flight path's
@@ -36,18 +40,30 @@ class AdsBDataset(Dataset):
         """
         if window_size < 1:
             raise ValueError("AdsBDataset.__init__: window_size must be at least 1")
+        if horizon < 1:
+            raise ValueError("AdsBDataset.__init__: horizon must be at least 1")
 
         self._window_size = window_size
+        self._horizon = horizon
         self._target_dims = TARGET_DIMS
-        self._flight_paths = [path.clone() for path in flight_paths if len(path) > self._window_size]   # Only use paths with at least 1 window slice.
-                                                                                                        # Cloning to avoid mutation via the list/Tensor reference.
+        self._flight_paths = []
+        for path in flight_paths:
+            if path.ndim != 2:                      # Sanity check: All paths should be 2D
+                raise ValueError("AdsBDataset.__init__: flight_paths must contain 2D Tensors")
+            if path.shape[1] < self._target_dims:   # Sanity check: All paths should have at least target_dims amount of columns
+                raise ValueError(f"AdsBDataset.__init__: flight_paths must contain Tensors with at least {self._target_dims} columns")
 
+            if len(path) >= self._window_size + self._horizon:
+                self._flight_paths.append(path.clone()) # Cloning to avoid mutation via the list/Tensor reference.
+
+        if len(self._flight_paths) == 0:
+            raise ValueError(f"AdsBDataset.__init__: flight_paths has no paths of at least size {self._window_size + self._horizon}")
 
         # _cumulative_sliding_window_count[i + 1] = total valid windows across groups 0..i
         # (i.e., _cumulative_sliding_window_count is a list, where each entry with index i + 1 contains the total number of sliding windows in all paths up to _flight_paths[i])
         self._cumulative_sliding_window_count = [0]
         for path in self._flight_paths:
-            num_windows = max(0, path.shape[0] - self._window_size) # path.shape[0] is equivalent to len(path); it returns num of rows
+            num_windows = max(0, path.shape[0] - self._window_size - self._horizon + 1) # path.shape[0] is equivalent to len(path); it returns num of rows
             self._cumulative_sliding_window_count.append(self._cumulative_sliding_window_count[-1] + num_windows)
 
     def __len__(self) -> int:
@@ -69,11 +85,12 @@ class AdsBDataset(Dataset):
 
         ## x is the input window slice (i.e., historical data preceding our target)
         ## We are taking a slice of a path the size of self._window_size, starting from data_point_idx.
-        x = path[data_point_idx : data_point_idx + self._window_size]       # Tensor shape: (window_size, num_features) or (W, F)
+        x = path[data_point_idx : data_point_idx + self._window_size]   # Tensor shape: (window_size, num_features) or (W, F)
 
         ## y is the targetted output data (i.e., the desired data being predicted)
-        ## We are indexing the data point after the window slice, and returning the first three values in that data point (i.e., lat, lon, geoaltitude).
-        y = path[data_point_idx + self._window_size, : self._target_dims]   # Tensor shape: (target_dims,)
+        ## We are indexing a `horizon` amount of data points after the window slice, and returning the first three values in each data point (i.e., lat, lon, geoaltitude).
+        y = path[data_point_idx + self._window_size : data_point_idx + self._window_size + self._horizon,
+                 : self._target_dims]                                   # Tensor shape: (horizon, target_dims) or (H, D)
         return x, y
 
 def createTrainValTestDataLoaders(flight_paths: list[torch.Tensor],
