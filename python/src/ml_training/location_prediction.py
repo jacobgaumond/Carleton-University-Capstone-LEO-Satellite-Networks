@@ -46,8 +46,18 @@ class AdsBDataset(Dataset):
         self._window_size = window_size
         self._horizon = horizon
         self._target_dims = TARGET_DIMS
-        self._flight_paths = [path.clone() for path in flight_paths if          # Cloning to avoid mutation via the list/Tensor reference.
-                              len(path) >= self._window_size + self._horizon]   # Only use paths with at least 1 sample (window slice & horizon).
+        self._flight_paths = []
+        for path in flight_paths:
+            if path.ndim != 2:                      # Sanity check: All paths should be 2D
+                raise ValueError("AdsBDataset.__init__: flight_paths must contain 2D Tensors")
+            if path.shape[1] < self._target_dims:   # Sanity check: All paths should have at least target_dims amount of columns
+                raise ValueError(f"AdsBDataset.__init__: flight_paths must contain Tensors with at least {self._target_dims} columns")
+
+            if len(path) >= self._window_size + self._horizon:
+                self._flight_paths.append(path.clone()) # Cloning to avoid mutation via the list/Tensor reference.
+
+        if len(self._flight_paths) == 0:
+            raise ValueError(f"AdsBDataset.__init__: flight_paths has no paths of at least size {self._window_size + self._horizon}")
 
         # _cumulative_sliding_window_count[i + 1] = total valid windows across groups 0..i
         # (i.e., _cumulative_sliding_window_count is a list, where each entry with index i + 1 contains the total number of sliding windows in all paths up to _flight_paths[i])
